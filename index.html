@@ -533,23 +533,15 @@
     <div class="game-subtitle">KUNSTSTOFF-MISSION // NATURWISSENSCHAFTEN</div>
   </div>
 
-  <!-- NIVEAU SELECTOR -->
-  <div class="niveau-bar">
-    <div style="font-family:'Share Tech Mono',monospace;font-size:0.8rem;color:#666;padding-top:8px;margin-right:4px;">NIVEAU:</div>
-    <button class="niveau-btn active" onclick="setNiveau('A')">🟢 A – Basis</button>
-    <button class="niveau-btn" onclick="setNiveau('B')">🟡 B – Standard</button>
-    <button class="niveau-btn" onclick="setNiveau('C')">🔴 C – Profi</button>
-  </div>
-
-  <!-- PROGRESS -->
-  <div class="progress-section">
+  <!-- PROGRESS (hidden until game starts) -->
+  <div class="progress-section" id="progress-section" style="display:none;">
     <div class="stage-dots">
       <div class="stage-dot active" id="dot1">S1</div>
       <div class="stage-dot" id="dot2">S2</div>
       <div class="stage-dot" id="dot3">S3</div>
     </div>
     <div class="progress-label">Stage <span id="stage-label">1</span>/3 — <span id="stage-name">Sammeln</span></div>
-    <div class="score-display">⭐ <span id="score">0</span> Punkte</div>
+    <div style="font-family:'Orbitron',monospace;font-size:0.75rem;color:var(--amber);" id="niveau-display"></div>
   </div>
 
   <!-- MAIN CONTENT -->
@@ -563,33 +555,239 @@
 // =====================================================================
 let niveau = 'A';
 let stage = 1;
-let score = 0;
-let stage1Code = '';
-let stage2Code = '';
-let stage3Code = '';
+let playerName = '';
+
+const CODES = {
+  s1: Array.from({length:4}, () => Math.floor(Math.random()*9)+1),
+  s2: Array.from({length:4}, () => Math.floor(Math.random()*9)+1),
+  s3: Array.from({length:4}, () => Math.floor(Math.random()*9)+1),
+};
 
 // =====================================================================
-// NIVEAU SWITCH
+// PERSISTENT STORAGE (localStorage per username)
 // =====================================================================
-function setNiveau(n) {
+const Store = {
+  key(name) { return 'walle_' + name.toLowerCase().replace(/\s+/g,'_'); },
+  load(name) {
+    try { const r = localStorage.getItem(this.key(name)); return r ? JSON.parse(r) : null; }
+    catch(e) { return null; }
+  },
+  save(name, data) {
+    try { localStorage.setItem(this.key(name), JSON.stringify(data)); } catch(e) {}
+  },
+  initUser(name) {
+    const ex = this.load(name);
+    if(ex) return ex;
+    const d = { name, playCount:0, sessions:[] };
+    this.save(name, d); return d;
+  },
+  startSession(name) {
+    const d = this.initUser(name);
+    d.playCount = (d.playCount||0) + 1;
+    d.currentSession = { startedAt:Date.now(), niveau, events:[] };
+    this.save(name, d); return d;
+  },
+  updateSession(name, events) {
+    const d = this.load(name); if(!d) return;
+    if(d.currentSession) d.currentSession.events = events;
+    this.save(name, d);
+  },
+  finishSession(name, summary) {
+    const d = this.load(name); if(!d) return;
+    if(d.currentSession) {
+      d.currentSession.finishedAt = Date.now();
+      d.currentSession.summary = summary;
+      d.sessions = d.sessions || [];
+      d.sessions.push(d.currentSession);
+      if(d.sessions.length > 20) d.sessions = d.sessions.slice(-20);
+      delete d.currentSession;
+    }
+    this.save(name, d);
+  },
+  getPlayCount(name) { const d = this.load(name); return d ? (d.playCount||1) : 1; },
+  getHistory(name)   { const d = this.load(name); return d ? (d.sessions||[]) : []; }
+};
+
+let userData = null;
+function saveProgress() { if(playerName) Store.updateSession(playerName, tracker.events); }
+
+// =====================================================================
+// TRACKER
+// =====================================================================
+const tracker = {
+  events: [],
+  log(category, question, given, correct, stageNum) {
+    const sn = stageNum !== undefined ? stageNum : stage;
+    const isCorrect = String(given) === String(correct);
+    this.events = this.events.filter(e => e.question !== question);
+    this.events.push({ stage: sn, category, question, given: String(given), correct: String(correct), isCorrect });
+  },
+  logSort(chipId, binGiven, binCorrect, stageNum) {
+    const sn = stageNum !== undefined ? stageNum : stage;
+    const isCorrect = binGiven === binCorrect;
+    this.events = this.events.filter(e => e.question !== 'sort-'+chipId);
+    this.events.push({ stage: sn, category:'sort', question:'sort-'+chipId, given:binGiven, correct:binCorrect, isCorrect });
+  },
+  summary() {
+    const byStage = [1,2,3].map(s => {
+      const evs = this.events.filter(e => Number(e.stage) === s);
+      const correct = evs.filter(e => e.isCorrect).length;
+      return { s, total: evs.length, correct };
+    });
+    return { byStage, wrongItems: this.events.filter(e => !e.isCorrect) };
+  },
+  computeScore() {
+    // 1.1 Sort: 3 pts proportional
+    const sortEvs = this.events.filter(e => e.category==='sort' && Number(e.stage)===1);
+    const sortPts = sortEvs.length > 0 ? Math.round(sortEvs.filter(e=>e.isCorrect).length / sortEvs.length * 3) : 0;
+    // 1.2, 1.3: 1pt each (for niveau A MC; for B drag-match; for C choice)
+    const q12 = this.events.find(e => ['S1-MC-12','S1-B-match-pet','S1-C-Expl-a'].includes(e.question));
+    const q13 = this.events.find(e => ['S1-MC-13','S1-B-match-ps','S1-C-Tabelle-Leitf'].includes(e.question));
+    // broader: 1pt per correct event in 1.2/1.3 group, max 1 each
+    const mc12Events = this.events.filter(e => Number(e.stage)===1 && ['S1-MC-12'].includes(e.question));
+    const mc13Events = this.events.filter(e => Number(e.stage)===1 && ['S1-MC-13'].includes(e.question));
+    const matchB12 = this.events.filter(e => e.question && e.question.startsWith('S1-B-match-'));
+    const matchB13 = this.events.filter(e => e.question && e.question.startsWith('S1-B-struct-'));
+    const cExplA = this.events.find(e => e.question==='S1-C-Expl-a');
+    const cExplB = this.events.find(e => e.question==='S1-C-Expl-b');
+
+    let pts12 = 0, pts13 = 0;
+    if(niveau==='A') {
+      pts12 = mc12Events.some(e=>e.isCorrect) ? 1 : 0;
+      pts13 = mc13Events.some(e=>e.isCorrect) ? 1 : 0;
+    } else if(niveau==='B') {
+      // each correct match = fraction; total 1 pt for 1.2, 1 for 1.3
+      const m12 = matchB12.length ? Math.round(matchB12.filter(e=>e.isCorrect).length/matchB12.length) : 0;
+      const m13 = matchB13.length ? Math.round(matchB13.filter(e=>e.isCorrect).length/matchB13.length) : 0;
+      pts12 = m12; pts13 = m13;
+    } else {
+      // C: 1.2 = choice questions (logged as S1-C-choice-a/b), 1.3 = table selects
+      const choiceA = this.events.find(e=>e.question==='S1-C-choice-a');
+      const choiceB = this.events.find(e=>e.question==='S1-C-choice-b');
+      pts12 = ((choiceA?.isCorrect?0.5:0) + (choiceB?.isCorrect?0.5:0));
+      const tabEvs = this.events.filter(e=>e.question?.startsWith('S1-C-Tabelle'));
+      pts13 = tabEvs.length ? Math.round(tabEvs.filter(e=>e.isCorrect).length/tabEvs.length) : 0;
+    }
+    // All other events (S2, S3): 1pt each, but skip free-text (category=text → manual)
+    const others = this.events.filter(e => !['sort','text'].includes(e.category) && Number(e.stage)>1);
+    const otherPts = others.filter(e=>e.isCorrect).length;
+    const otherMax = others.length;
+    const total = sortPts + pts12 + pts13 + otherPts;
+    const max = 3 + 1 + 1 + otherMax;
+    return { earned: Math.round(total*10)/10, max: max || 1 };
+  }
+};
+
+// =====================================================================
+// NAME SCREEN
+// =====================================================================
+// =====================================================================
+// STEP 1: NIVEAU SCREEN
+// =====================================================================
+function renderNiveauScreen() {
+  document.getElementById('progress-section').style.display = 'none';
+  document.getElementById('main-content').innerHTML = `
+    <div style="text-align:center;padding:50px 20px;">
+      <div style="font-size:5rem;margin-bottom:16px;animation:float 3s ease-in-out infinite;">🤖</div>
+      <div style="font-family:'Orbitron',monospace;font-size:1.4rem;color:var(--sand);margin-bottom:8px;text-shadow:0 0 20px rgba(232,200,122,0.4);">WALL-E räumt die Erde auf</div>
+      <div style="font-family:'Share Tech Mono',monospace;font-size:0.8rem;color:var(--sky);letter-spacing:3px;margin-bottom:40px;">KUNSTSTOFF-MISSION // KLASSE 9</div>
+      <div style="background:var(--panel);border:1px solid var(--dim);border-radius:12px;padding:30px;max-width:460px;margin:0 auto;">
+        <div style="font-family:'Orbitron',monospace;font-size:0.7rem;color:var(--amber);letter-spacing:3px;margin-bottom:20px;">▶ SCHWIERIGKEIT WÄHLEN</div>
+        <div style="display:flex;flex-direction:column;gap:12px;">
+          <button onclick="selectNiveau('A')"
+            style="font-family:'Nunito',sans-serif;font-size:0.95rem;font-weight:700;padding:16px 20px;background:#1a140a;border:2px solid var(--dim);border-radius:8px;color:#c8b880;cursor:pointer;text-align:left;transition:all 0.2s;"
+            onmouseover="this.style.borderColor='var(--green)';this.style.color='var(--green)'"
+            onmouseout="this.style.borderColor='var(--dim)';this.style.color='#c8b880'">
+            🟢 &nbsp;<strong>Basis</strong> — Sortieren, Multiple Choice, einfache Zuordnungen
+          </button>
+          <button onclick="selectNiveau('B')"
+            style="font-family:'Nunito',sans-serif;font-size:0.95rem;font-weight:700;padding:16px 20px;background:#1a140a;border:2px solid var(--dim);border-radius:8px;color:#c8b880;cursor:pointer;text-align:left;transition:all 0.2s;"
+            onmouseover="this.style.borderColor='var(--amber)';this.style.color='var(--amber)'"
+            onmouseout="this.style.borderColor='var(--dim)';this.style.color='#c8b880'">
+            🟡 &nbsp;<strong>Standard</strong> — Matching, Tabellen ergänzen, Diagramme auswerten
+          </button>
+          <button onclick="selectNiveau('C')"
+            style="font-family:'Nunito',sans-serif;font-size:0.95rem;font-weight:700;padding:16px 20px;background:#1a140a;border:2px solid var(--dim);border-radius:8px;color:#c8b880;cursor:pointer;text-align:left;transition:all 0.2s;"
+            onmouseover="this.style.borderColor='var(--red)';this.style.color='#e88060'"
+            onmouseout="this.style.borderColor='var(--dim)';this.style.color='#c8b880'">
+            🔴 &nbsp;<strong>Profi</strong> — Probenanalyse, Erklärungen bewerten, Strukturzuordnung
+          </button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function selectNiveau(n) {
   niveau = n;
-  document.querySelectorAll('.niveau-btn').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
-  stage = 1;
-  score = 0;
-  stage1Code = ''; stage2Code = ''; stage3Code = '';
-  updateProgress(1, 'Sammeln');
+  renderNameScreen();
+}
+
+// =====================================================================
+// STEP 2: NAME SCREEN
+// =====================================================================
+function renderNameScreen() {
+  const nLabel = niveau==='A'?'🟢 Basis':niveau==='B'?'🟡 Standard':'🔴 Profi';
+  document.getElementById('main-content').innerHTML = `
+    <div style="text-align:center;padding:50px 20px;">
+      <div style="font-size:4rem;margin-bottom:16px;animation:float 3s ease-in-out infinite;">🤖</div>
+      <div style="font-family:'Share Tech Mono',monospace;font-size:0.75rem;color:var(--amber);letter-spacing:3px;margin-bottom:6px;">NIVEAU: ${nLabel}</div>
+      <div style="font-family:'Orbitron',monospace;font-size:1.1rem;color:var(--sand);margin-bottom:32px;">Wer spielt?</div>
+      <div style="background:var(--panel);border:1px solid var(--dim);border-radius:12px;padding:30px;max-width:420px;margin:0 auto;">
+        <div style="font-family:'Orbitron',monospace;font-size:0.7rem;color:var(--amber);letter-spacing:3px;margin-bottom:16px;">▶ NAME EINGEBEN</div>
+        <p style="font-size:0.9rem;color:#c8b880;margin-bottom:20px;">Dein Name wird für die Auswertung gespeichert.</p>
+        <input id="name-input" type="text" placeholder="Vor- und Nachname..." maxlength="40" autofocus
+          style="width:100%;background:#0f0c06;border:2px solid var(--dim);border-radius:6px;color:var(--sand);font-family:'Nunito',sans-serif;font-size:1rem;padding:12px 16px;margin-bottom:12px;text-align:center;outline:none;transition:border-color 0.2s;"
+          oninput="checkReturning(this.value)"
+          onkeydown="if(event.key==='Enter')startMission()" />
+        <div id="returning-info" style="min-height:32px;margin-bottom:12px;"></div>
+        <div style="display:flex;gap:10px;">
+          <button onclick="renderNiveauScreen()"
+            style="font-family:'Orbitron',monospace;font-size:0.7rem;letter-spacing:1px;padding:12px 16px;background:transparent;border:2px solid var(--dim);color:#888;border-radius:6px;cursor:pointer;transition:all 0.2s;"
+            onmouseover="this.style.borderColor='var(--sand)';this.style.color='var(--sand)'"
+            onmouseout="this.style.borderColor='var(--dim)';this.style.color='#888'">
+            ← ZURÜCK
+          </button>
+          <button onclick="startMission()"
+            style="font-family:'Orbitron',monospace;font-size:0.8rem;letter-spacing:2px;padding:12px 0;background:var(--amber);border:none;color:var(--dark);border-radius:6px;cursor:pointer;font-weight:700;flex:1;">
+            ▶ MISSION STARTEN
+          </button>
+        </div>
+      </div>
+    </div>`;
+  setTimeout(() => { const el = document.getElementById('name-input'); if(el) el.focus(); }, 100);
+}
+
+function startMission() {
+  playerName = document.getElementById('name-input').value.trim() || 'Unbekannt';
+  userData = Store.startSession(playerName);
+  const nLabel = niveau==='A'?'🟢 Basis':niveau==='B'?'🟡 Standard':'🔴 Profi';
+  document.getElementById('progress-section').style.display = 'flex';
+  document.getElementById('niveau-display').textContent = nLabel;
   renderStage1();
+}
+
+function checkReturning(val) {
+  const input = val.trim();
+  const el = document.getElementById('returning-info');
+  if(!el || input.length < 2) { if(el) el.innerHTML=''; return; }
+  const d = Store.load(input);
+  if(d && d.playCount > 0) {
+    const best = d.sessions?.length > 0 ? Math.max(...d.sessions.map(s=>s.summary?.pct||0)) : 0;
+    el.innerHTML = `<div style="background:rgba(240,165,0,0.1);border:1px solid var(--amber);border-radius:6px;padding:8px 12px;font-size:0.82rem;color:var(--amber);">
+      👋 Willkommen zurück! ${d.playCount}× gespielt · Bestes Ergebnis: ${best}%
+    </div>`;
+  } else {
+    el.innerHTML = '';
+  }
 }
 
 // =====================================================================
 // PROGRESS
 // =====================================================================
 function updateProgress(s, name) {
-  stage = s;  // ← keep global stage in sync
+  stage = s;
   document.getElementById('stage-label').textContent = s;
   document.getElementById('stage-name').textContent = name;
-  document.getElementById('score').textContent = score;
   for(let i=1;i<=3;i++){
     const d = document.getElementById('dot'+i);
     d.className = 'stage-dot';
@@ -598,338 +796,23 @@ function updateProgress(s, name) {
   }
 }
 
-// =====================================================================
-// CODE DISPLAY
-// =====================================================================
-function renderCodeBox(containerId, codeDigits, explanation, onCheck) {
-  const el = document.getElementById(containerId);
-  const filled = codeDigits.filter(d => d !== '?').length;
-  const allFilled = codeDigits.every(d => d !== '?');
-  
-  let digitsHtml = '';
-  codeDigits.forEach((d,i) => {
-    if(d === '-') { digitsHtml += `<div class="code-digit separator">–</div>`; return; }
-    digitsHtml += `<div class="code-digit ${d!=='?'?'filled':''}">${d==='?'?'_':d}</div>`;
-  });
-
-  el.innerHTML = `
-    <div class="code-section">
-      <div class="code-header">▶ FREISCHALT-CODE</div>
-      <div class="code-display">${digitsHtml}</div>
-      <div class="code-explanation">${explanation}</div>
-      <button class="check-btn" onclick="${onCheck}()" ${!allFilled?'disabled':''}>
-        CODE PRÜFEN
-      </button>
-      <div id="code-feedback-${containerId}" class="code-feedback"></div>
-    </div>`;
-}
-
-function showFeedback(containerId, success, msg) {
-  const el = document.getElementById('code-feedback-' + containerId);
-  el.className = 'code-feedback ' + (success ? 'success' : 'error');
-  el.textContent = msg;
-}
-
-// =====================================================================
-// ███████████  STAGE 1: SAMMELN – Kunststoffe sortieren  █████████████
-// =====================================================================
-// Code: S1-Code = 4 Ziffern
-// A: Vorgefertigte Auswahl-Aufgabe + einfaches Matching
-// B: Matching + Eigenschaften-Zuordnung
-// C: Vollständige Tabelle + Begründungen + Kurzstruktur
-
-let s1_sortAnswers = {};
-let s1_matchSelected = null;
-let s1_matchDone = {};
-let s1_mcAnswers = {};
-
-function renderStage1() {
+function setNiveau(n) {
+  niveau = n;
+  tracker.events = [];
   updateProgress(1, 'Sammeln');
-  stage1Code = '';
-  s1_sortAnswers = {};
-  s1_matchSelected = null;
-  s1_matchDone = {};
-  s1_mcAnswers = {};
-
-  const nBadge = niveau === 'A' ? '<span class="badge badge-a">NIVEAU A</span>' :
-                  niveau === 'B' ? '<span class="badge badge-b">NIVEAU B</span>' :
-                                   '<span class="badge badge-c">NIVEAU C</span>';
-
-  let html = `
-  <div class="story-box">
-    <div class="story-tag">▶ MISSIONSBRIEFING // STUFE 1</div>
-    <div class="walle-face">🤖</div>
-    <p class="story-text">
-      <em>"Blubb… Whirrr…"</em><br>
-      WALL-E schiebt sich durch Berge von Müll und entdeckt: Fast alles besteht aus <strong>Kunststoff</strong>!
-      Aber nicht alle Kunststoffe können zusammen recycelt werden. WALL-E braucht deine Hilfe beim
-      <strong>Erkennen, Sortieren und Zuordnen</strong>.
-      ${nBadge}
-    </p>
-  </div>`;
-
-  // ──── AUFGABE 1.1: Sortier-Aufgabe ────────────────────────────────
-  if(niveau === 'A') {
-    html += `
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">1.1</div>
-        <div class="task-title">Kunststoffe sortieren</div>
-        <div class="task-hint">Hilfe: Tabelle S. 349</div>
-      </div>
-      <div class="task-body">
-        WALL-E hat 9 Kunststoffe gefunden. Ziehe sie in die richtige Sammelbehälter!
-        <br><em style="color:#888;font-size:0.8rem;">Tipp: Schau in die Tabelle auf Seite 349 deines Buches.</em>
-      </div>
-      <div class="sort-area">
-        <div class="sort-items" id="sort-pool" ondragover="poolDragOver(event)" ondrop="poolDrop(event)">
-          <div class="sort-chip" draggable="true" data-chip="PET" ondragstart="chipDrag(event,'PET')">PET 🍶</div>
-          <div class="sort-chip" draggable="true" data-chip="PS" ondragstart="chipDrag(event,'PS')">PS 🥤</div>
-          <div class="sort-chip" draggable="true" data-chip="PVC" ondragstart="chipDrag(event,'PVC')">PVC 🪟</div>
-          <div class="sort-chip" draggable="true" data-chip="PP" ondragstart="chipDrag(event,'PP')">PP 🪑</div>
-          <div class="sort-chip" draggable="true" data-chip="HDPE" ondragstart="chipDrag(event,'HDPE')">HDPE 🧴</div>
-          <div class="sort-chip" draggable="true" data-chip="LDPE" ondragstart="chipDrag(event,'LDPE')">LDPE 🛍️</div>
-          <div class="sort-chip" draggable="true" data-chip="PF" ondragstart="chipDrag(event,'PF')">PF 🔌</div>
-          <div class="sort-chip" draggable="true" data-chip="PA" ondragstart="chipDrag(event,'PA')">PA 🧵</div>
-          <div class="sort-chip" draggable="true" data-chip="PU" ondragstart="chipDrag(event,'PU')">PU 🧽</div>
-        </div>
-        <div class="bins-row">
-          <div class="bin" id="bin-thermo" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop(event,'thermo')">
-            <div class="bin-icon">♻️</div>
-            <div class="bin-label">THERMOPLASTE</div>
-          </div>
-          <div class="bin" id="bin-duro" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop(event,'duro')">
-            <div class="bin-icon">🔩</div>
-            <div class="bin-label">DUROPLASTE</div>
-          </div>
-          <div class="bin" id="bin-elasto" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop(event,'elasto')">
-            <div class="bin-icon">🔵</div>
-            <div class="bin-label">ELASTOMERE</div>
-          </div>
-        </div>
-      </div>
-      <button class="check-btn" onclick="checkS1Sort()" style="margin-top:10px;">SORTIERUNG PRÜFEN</button>
-      <div id="sort-feedback" class="code-feedback"></div>
-    </div>`;
-  } else {
-    // B+C: gleiche Aufgabe, aber Bins haben keine Icons-Hinweise, nur Namen
-    html += `
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">1.1</div>
-        <div class="task-title">Kunststoffe klassifizieren</div>
-        <div class="task-hint">S. 350–352</div>
-      </div>
-      <div class="task-body">
-        Ordne die Kunststoffe den drei Hauptgruppen zu. Nutze dein Wissen aus dem Buch!
-      </div>
-      <div class="sort-area">
-        <div class="sort-items" id="sort-pool" ondragover="poolDragOver(event)" ondrop="poolDrop(event)">
-          <div class="sort-chip" draggable="true" data-chip="PET" ondragstart="chipDrag(event,'PET')">PET</div>
-          <div class="sort-chip" draggable="true" data-chip="PS" ondragstart="chipDrag(event,'PS')">PS</div>
-          <div class="sort-chip" draggable="true" data-chip="PVC" ondragstart="chipDrag(event,'PVC')">PVC</div>
-          <div class="sort-chip" draggable="true" data-chip="PP" ondragstart="chipDrag(event,'PP')">PP</div>
-          <div class="sort-chip" draggable="true" data-chip="HDPE" ondragstart="chipDrag(event,'HDPE')">HDPE</div>
-          <div class="sort-chip" draggable="true" data-chip="LDPE" ondragstart="chipDrag(event,'LDPE')">LDPE</div>
-          <div class="sort-chip" draggable="true" data-chip="PF" ondragstart="chipDrag(event,'PF')">PF</div>
-          <div class="sort-chip" draggable="true" data-chip="PA" ondragstart="chipDrag(event,'PA')">PA</div>
-          <div class="sort-chip" draggable="true" data-chip="PU" ondragstart="chipDrag(event,'PU')">PU</div>
-        </div>
-        <div class="bins-row">
-          <div class="bin" id="bin-thermo" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop(event,'thermo')">
-            <div class="bin-label">THERMOPLASTE</div>
-          </div>
-          <div class="bin" id="bin-duro" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop(event,'duro')">
-            <div class="bin-label">DUROPLASTE</div>
-          </div>
-          <div class="bin" id="bin-elasto" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop(event,'elasto')">
-            <div class="bin-label">ELASTOMERE</div>
-          </div>
-        </div>
-      </div>
-      <button class="check-btn" onclick="checkS1Sort()" style="margin-top:10px;">SORTIERUNG PRÜFEN</button>
-      <div id="sort-feedback" class="code-feedback"></div>
-    </div>`;
-  }
-
-  // ──── AUFGABE 1.2: Matching / MC ──────────────────────────────────
-  if(niveau === 'A') {
-    html += `
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">1.2</div>
-        <div class="task-title">Eigenschaften erkennen</div>
-        <div class="task-hint">Buchseite 350–351</div>
-      </div>
-      <div class="task-body">
-        Welche Aussage beschreibt <strong>Thermoplaste</strong> richtig? Wähle die richtige Antwort.
-      </div>
-      <div class="options-list">
-        <div class="option-item" onclick="selectMC('12',0,1)">
-          <div class="option-radio"></div>
-          Thermoplaste sind hitzebeständig und lassen sich nicht formen.
-        </div>
-        <div class="option-item" onclick="selectMC('12',1,1)">
-          <div class="option-radio"></div>
-          Thermoplaste werden beim Erwärmen weich und können geformt werden.
-        </div>
-        <div class="option-item" onclick="selectMC('12',2,1)">
-          <div class="option-radio"></div>
-          Thermoplaste sind stark elastisch wie Gummibänder.
-        </div>
-        <div class="option-item" onclick="selectMC('12',3,1)">
-          <div class="option-radio"></div>
-          Thermoplaste sind immer biologisch abbaubar.
-        </div>
-      </div>
-      <div id="mc12-feedback" class="code-feedback"></div>
-    </div>
-
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">1.3</div>
-        <div class="task-title">WALL-E fragt: Was ist das?</div>
-        <div class="task-hint">S. 346</div>
-      </div>
-      <div class="task-body">
-        WALL-E findet einen Autoreifen. Aus welcher Kunststoffgruppe besteht er?
-      </div>
-      <div class="options-list">
-        <div class="option-item" onclick="selectMC('13',0,2)">
-          <div class="option-radio"></div>
-          Thermoplast
-        </div>
-        <div class="option-item" onclick="selectMC('13',1,2)">
-          <div class="option-radio"></div>
-          Duroplasten
-        </div>
-        <div class="option-item" onclick="selectMC('13',2,2)">
-          <div class="option-radio"></div>
-          Elastomer
-        </div>
-      </div>
-      <div id="mc13-feedback" class="code-feedback"></div>
-    </div>`;
-  } else if (niveau === 'B') {
-    html += `
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">1.2</div>
-        <div class="task-title">Matching: Kunststoff ↔ Produkt</div>
-        <div class="task-hint">S. 349 Kreisdiagramm</div>
-      </div>
-      <div class="task-body">
-        Klicke zuerst einen Kunststoff, dann das passende Produkt. WALL-E muss wissen, wo er suchen soll!
-      </div>
-      ${buildMatchingA()}
-      <div id="match-feedback" class="code-feedback"></div>
-    </div>
-
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">1.3</div>
-        <div class="task-title">Verknüpfungsgrad</div>
-        <div class="task-hint">S. 352</div>
-      </div>
-      <div class="task-body">
-        Welche Aussage zum inneren Aufbau ist korrekt? (Mehrere können richtig sein)
-      </div>
-      <div class="options-list">
-        <div class="option-item" onclick="toggleCheck(this,'b_13_0')"><div class="option-radio"></div>Thermoplaste haben lange, unverzweigte Ketten die aneinander vorbeigleiten können.</div>
-        <div class="option-item" onclick="toggleCheck(this,'b_13_1')"><div class="option-radio"></div>Duroplaste haben ein engmaschiges 3D-Netz aus Elektronenpaarbindungen.</div>
-        <div class="option-item" onclick="toggleCheck(this,'b_13_2')"><div class="option-radio"></div>Elastomere sind wenig vernetzt und können sich dehnen.</div>
-        <div class="option-item" onclick="toggleCheck(this,'b_13_3')"><div class="option-radio"></div>Alle Kunststoffe bestehen aus Monomeren.</div>
-      </div>
-      <button class="check-btn" onclick="checkB13()" style="margin-top:10px;">ANTWORT PRÜFEN</button>
-      <div id="b13-feedback" class="code-feedback"></div>
-    </div>`;
-  } else {
-    // Niveau C
-    html += `
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">1.2</div>
-        <div class="task-title">Kunststoff-Analyse: WALL-Es Fund</div>
-        <div class="task-hint">S. 352–353</div>
-      </div>
-      <div class="task-body">
-        WALL-E findet einen grünen Kochlöffel (Duroplast) und einen Autoreifen. Beantworte:
-      </div>
-      <div class="info-box">
-        <strong>Aufgabe 1.2a:</strong> Erkläre, warum der Kochlöffel beim Kochen nicht weich wird, 
-        obwohl er aus Kunststoff besteht. Nutze Begriffe: <em>Elektronenpaarbindung, Netz, Erwärmen</em>.
-      </div>
-      <textarea id="c12a" style="width:100%;background:#0f0c06;border:1px solid var(--dim);border-radius:6px;color:#c8b880;padding:10px;font-family:'Nunito',sans-serif;font-size:0.88rem;min-height:80px;margin:8px 0;" placeholder="Schreibe hier deine Erklärung..."></textarea>
-
-      <div class="info-box" style="margin-top:10px;">
-        <strong>Aufgabe 1.2b:</strong> Der Reifen besteht aus Elastomer. Erkläre mithilfe des Begriffs 
-        <em>Verknüpfungspunkte</em>, warum er nach Dehnung wieder in die Originalform zurückkehrt.
-      </div>
-      <textarea id="c12b" style="width:100%;background:#0f0c06;border:1px solid var(--dim);border-radius:6px;color:#c8b880;padding:10px;font-family:'Nunito',sans-serif;font-size:0.88rem;min-height:80px;margin:8px 0;" placeholder="Schreibe hier deine Erklärung..."></textarea>
-
-      <button class="check-btn" onclick="checkC12()" style="margin-top:8px;">ERKLÄRUNGEN EINREICHEN</button>
-      <div id="c12-feedback" class="code-feedback"></div>
-    </div>
-
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">1.3</div>
-        <div class="task-title">Tabellen-Analyse: Metalle vs. Kunststoffe</div>
-        <div class="task-hint">S. 347 + Buch S. 353</div>
-      </div>
-      <div class="task-body">
-        WALL-E kann nur Kunststoffe sortieren, keine Metalle. Vergleiche beide Materialien:
-      </div>
-      <table class="prop-table">
-        <tr><th>Eigenschaft</th><th>Metalle</th><th>Kunststoffe</th></tr>
-        <tr><td>Elektrische Leitfähigkeit</td><td class="highlight">leitet</td><td><select id="sel1" onchange="cSelChange()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px 8px;border-radius:4px;font-size:0.82rem;"><option value="">—wählen—</option><option>leitet nicht</option><option>leitet immer</option><option>leitet manchmal</option></select></td></tr>
-        <tr><td>Verformbarkeit bei Wärme</td><td class="highlight">schmilzt bei hohen Temp.</td><td><select id="sel2" onchange="cSelChange()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px 8px;border-radius:4px;font-size:0.82rem;"><option value="">—wählen—</option><option>nur Thermoplaste verformen sich</option><option>alle verformen sich</option><option>keiner verformt sich</option></select></td></tr>
-        <tr><td>Biologischer Abbau</td><td class="highlight">rosten, oxidieren</td><td><select id="sel3" onchange="cSelChange()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px 8px;border-radius:4px;font-size:0.82rem;"><option value="">—wählen—</option><option>schwer biologisch abbaubar</option><option>leicht biologisch abbaubar</option><option>gar nicht abbaubar</option></select></td></tr>
-        <tr><td>Gewicht</td><td class="highlight">schwer</td><td><select id="sel4" onchange="cSelChange()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px 8px;border-radius:4px;font-size:0.82rem;"><option value="">—wählen—</option><option>leichter</option><option>gleich schwer</option><option>schwerer</option></select></td></tr>
-      </table>
-      <button class="check-btn" onclick="checkC13()" style="margin-top:10px;">TABELLE PRÜFEN</button>
-      <div id="c13-feedback" class="code-feedback"></div>
-    </div>`;
-  }
-
-  // ──── CODE BOX ────────────────────────────────────────────────────
-  html += `<div id="s1-code-area"></div>`;
-
-  document.getElementById('main-content').innerHTML = html;
-  updateS1Code();
+  renderStage1();
 }
 
 // =====================================================================
-// TRACKING SYSTEM – records every answer attempt across all stages
+// DRAG-DROP SORT (Stage 1 bins)
 // =====================================================================
-const tracker = {
-  events: [],
-  log(category, question, given, correct, points, stageNum) {
-    const sn = stageNum !== undefined ? stageNum : stage;
-    const isCorrect = String(given) === String(correct);
-    // Keep only the last attempt per question
-    this.events = this.events.filter(e => e.question !== question);
-    this.events.push({ stage: sn, category, question, given: String(given), correct: String(correct), isCorrect, points, ts: Date.now() });
-  },
-  logSort(chipId, binGiven, binCorrect, stageNum) {
-    const sn = stageNum !== undefined ? stageNum : stage;
-    const isCorrect = binGiven === binCorrect;
-    this.events = this.events.filter(e => e.question !== 'sort-'+chipId);
-    this.events.push({ stage: sn, category: 'sort', question: 'sort-'+chipId, given: binGiven, correct: binCorrect, isCorrect, points: isCorrect ? 5 : 0, ts: Date.now() });
-  },
-  summary() {
-    const byStage = [1,2,3].map(s => {
-      const evs = this.events.filter(e => Number(e.stage) === s);
-      const correct = evs.filter(e => e.isCorrect).length;
-      return { s, total: evs.length, correct, wrong: evs.length - correct };
-    });
-    const wrongItems = this.events.filter(e => !e.isCorrect);
-    return { byStage, wrongItems };
-  }
-};
-
-// ── Sorting logic ──
+let s1_sortAnswers = {};
 let draggedChip = null;
+
+const sortCorrect = {
+  PET:'thermo', PS:'thermo', PVC:'thermo', PP:'thermo',
+  HDPE:'thermo', LDPE:'thermo', PA:'thermo', PF:'duro', PU:'elasto'
+};
 
 function makeChip(chipId, label, inBin) {
   const chip = document.createElement('div');
@@ -938,14 +821,12 @@ function makeChip(chipId, label, inBin) {
   chip.draggable = true;
   chip.dataset.chip = chipId;
   chip.textContent = label;
-  // dragstart: store chipId in closure AND global
-  chip.addEventListener('dragstart', (ev) => {
+  chip.addEventListener('dragstart', ev => {
     draggedChip = chipId;
     ev.dataTransfer.setData('text/plain', chipId);
     chip.classList.add('dragging');
   });
   chip.addEventListener('dragend', () => chip.classList.remove('dragging'));
-  // click in bin → return to pool
   if(inBin) {
     chip.title = 'Klicken zum Zurücklegen';
     chip.addEventListener('click', () => {
@@ -953,393 +834,608 @@ function makeChip(chipId, label, inBin) {
       chip.remove();
       const pool = document.getElementById('sort-pool');
       if(pool) pool.appendChild(makeChip(chipId, label, false));
-      updateS1Code();
+      logAllSorts();
     });
   }
   return chip;
 }
-
-function chipDrag(e, id) {
-  draggedChip = id;
-  e.dataTransfer && e.dataTransfer.setData('text/plain', id);
-}
-
-function chipDrop(e, binName) {
-  e.preventDefault();
-  const bin = document.getElementById('bin-' + binName);
-  bin.classList.remove('drag-over');
-  // prefer dataTransfer, fallback to global
-  const chipId = (e.dataTransfer && e.dataTransfer.getData('text/plain')) || draggedChip;
-  if(!chipId) return;
-
-  // find original chip label (with emoji for Niveau A)
-  const existingEl = document.querySelector(`[data-chip="${chipId}"]`);
-  const label = existingEl ? existingEl.textContent : chipId;
-
-  // remove from wherever it currently is
-  if(existingEl) {
-    delete s1_sortAnswers[chipId];
-    existingEl.remove();
-  }
-
-  s1_sortAnswers[chipId] = binName;
-  bin.appendChild(makeChip(chipId, label, true));
-  draggedChip = null;
-  updateS1Code();
-}
-
-// Pool chips also draggable via ondragover on pool (allow re-drop back)
+function chipDrag(e, id) { draggedChip = id; e.dataTransfer && e.dataTransfer.setData('text/plain', id); }
 function poolDragOver(e) { e.preventDefault(); }
 function poolDrop(e) {
   e.preventDefault();
   const chipId = (e.dataTransfer && e.dataTransfer.getData('text/plain')) || draggedChip;
   if(!chipId) return;
-  const existingEl = document.querySelector(`[data-chip="${chipId}"]`);
-  const label = existingEl ? existingEl.textContent : chipId;
-  if(existingEl) {
-    // only move if it's currently in a bin (not already in pool)
-    const inPool = existingEl.closest('#sort-pool');
-    if(inPool) return;
-    delete s1_sortAnswers[chipId];
-    existingEl.remove();
-  }
+  const el = document.querySelector(`[data-chip="${chipId}"]`);
+  if(el && el.closest('#sort-pool')) return;
+  const label = el ? el.textContent : chipId;
+  if(el) { delete s1_sortAnswers[chipId]; el.remove(); }
   const pool = document.getElementById('sort-pool');
   if(pool) pool.appendChild(makeChip(chipId, label, false));
-  draggedChip = null;
-  updateS1Code();
+  draggedChip = null; logAllSorts();
+}
+function chipDrop(e, binName) {
+  e.preventDefault();
+  const bin = document.getElementById('bin-'+binName);
+  bin.classList.remove('drag-over');
+  const chipId = (e.dataTransfer && e.dataTransfer.getData('text/plain')) || draggedChip;
+  if(!chipId) return;
+  const el = document.querySelector(`[data-chip="${chipId}"]`);
+  const label = el ? el.textContent : chipId;
+  if(el) { delete s1_sortAnswers[chipId]; el.remove(); }
+  s1_sortAnswers[chipId] = binName;
+  bin.appendChild(makeChip(chipId, label, true));
+  draggedChip = null; logAllSorts();
+}
+function logAllSorts() {
+  Object.keys(sortCorrect).forEach(k => {
+    if(s1_sortAnswers[k]) tracker.logSort(k, s1_sortAnswers[k], sortCorrect[k], 1);
+  });
 }
 
-// Correct answers
-const sortCorrect = {
-  PET:'thermo', PS:'thermo', PVC:'thermo', PP:'thermo',
-  HDPE:'thermo', LDPE:'thermo',
-  PF:'duro', PA:'thermo',
-  PU:'elasto'
-};
-
-function checkS1Sort() {
-  let correct = 0;
-  let total = Object.keys(sortCorrect).length;
-  for(let k in sortCorrect) {
-    if(s1_sortAnswers[k] === sortCorrect[k]) correct++;
-    tracker.logSort(k, s1_sortAnswers[k] || 'nicht sortiert', sortCorrect[k], 1);
-  }
-  const fb = document.getElementById('sort-feedback');
-  if(correct === total) {
-    fb.className = 'code-feedback success';
-    fb.textContent = `✓ Perfekt! Alle ${total} Kunststoffe richtig sortiert! +${total*5} Punkte`;
-    score += total * 5;
-    document.getElementById('score').textContent = score;
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = `${correct}/${total} richtig. Überprüfe nochmal: Duroplaste = sehr engmaschig vernetzt, Elastomere = dehnbar.`;
-  }
-  updateS1Code();
-}
-
-// MC logic
+// =====================================================================
+// NIVEAU A: plain MC (no green/red feedback)
+// =====================================================================
+let s1_mcAnswers = {};
 function selectMC(id, idx, correct) {
   const container = event.target.closest('.options-list');
   const items = container.querySelectorAll('.option-item');
-  items.forEach((it,i) => {
-    it.classList.remove('selected','correct','wrong');
-    if(i === idx) {
-      it.classList.add('selected');
-      s1_mcAnswers[id] = idx;
+  items.forEach(it => it.classList.remove('selected'));
+  items[idx].classList.add('selected');
+  s1_mcAnswers[id] = idx;
+  tracker.log('mc', 'S1-MC-'+id, idx, correct, 1);
+}
+
+// =====================================================================
+// NIVEAU B: DRAG-DROP MATCHING (1.2) — randomised, no feedback
+// =====================================================================
+// matchDragState: which left-item is being dragged
+let matchDragState = {};
+// assignments: leftId -> rightId
+let matchAssignments = {};
+
+function buildDragMatchB() {
+  // Left items (kunststoffe) fixed order
+  const leftItems = [
+    {id:'pet', label:'PET'},
+    {id:'ps',  label:'PS (Polystyrol)'},
+    {id:'pvc', label:'PVC (Polyvinylchlorid)'},
+    {id:'hdpe',label:'HDPE (Polyethen, hohe Dichte)'},
+    {id:'pp',  label:'PP (Polypropylen)'},
+  ];
+  // Right items (Verwendung) — shuffled each time
+  const rightItems = shuffle([
+    {id:'pet_r', label:'Folien, Lebensmittelflaschen, PET-Flaschen'},
+    {id:'ps_r',  label:'Styropor-Verpackungen, Dämmstoffe'},
+    {id:'pvc_r', label:'Fensterrahmen, Rohre, Bodenbeläge'},
+    {id:'hdpe_r',label:'Reinigungsmittelbehälter, Plastikflaschen'},
+    {id:'pp_r',  label:'Kindersitze, Stoßstangen, Lebensmittelverp.'},
+  ]);
+
+  let html = `<div style="margin:12px 0;">
+    <div class="info-box" style="margin-bottom:12px;">Ziehe einen Kunststoff auf die passende Verwendung. Klicke eine Verbindung um sie zu lösen.</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div>
+        <div class="match-col-header">KUNSTSTOFF</div>`;
+  leftItems.forEach(it => {
+    html += `<div class="match-item drag-source" id="bm-${it.id}" draggable="true"
+      ondragstart="matchDragStart(event,'${it.id}')"
+      style="cursor:grab;position:relative;">
+      ${it.label}
+      <span id="bm-${it.id}-tag" style="display:none;position:absolute;right:6px;top:50%;transform:translateY(-50%);font-size:0.7rem;background:var(--amber);color:#000;border-radius:10px;padding:1px 7px;"></span>
+    </div>`;
+  });
+  html += `</div><div>
+        <div class="match-col-header">VERWENDUNG</div>`;
+  rightItems.forEach(it => {
+    html += `<div class="match-item drag-target" id="bm-${it.id}"
+      ondragover="event.preventDefault();this.classList.add('selected')"
+      ondragleave="this.classList.remove('selected')"
+      ondrop="matchDrop(event,'${it.id}')"
+      onclick="matchDetach('${it.id}')">
+      ${it.label}
+    </div>`;
+  });
+  html += `</div></div></div>`;
+  return html;
+}
+
+function matchDragStart(e, leftId) {
+  matchDragState.leftId = leftId;
+  e.dataTransfer.setData('text/plain', leftId);
+}
+
+const matchBPairsCorrect = {pet:'pet_r', ps:'ps_r', pvc:'pvc_r', hdpe:'hdpe_r', pp:'pp_r'};
+
+function matchDrop(e, rightId) {
+  e.preventDefault();
+  const target = e.target.closest('.drag-target');
+  if(target) target.classList.remove('selected');
+  const leftId = matchDragState.leftId || e.dataTransfer.getData('text/plain');
+  if(!leftId) return;
+  // Remove previous assignment for this leftId
+  const prev = matchAssignments[leftId];
+  if(prev) {
+    const prevTarget = document.getElementById('bm-'+prev);
+    if(prevTarget) { prevTarget.style.borderColor=''; prevTarget.style.background=''; prevTarget.dataset.assignedBy=''; }
+  }
+  // Remove any existing assignment to this rightId
+  Object.entries(matchAssignments).forEach(([lId, rId]) => {
+    if(rId === rightId && lId !== leftId) {
+      const ltag = document.getElementById('bm-'+lId+'-tag');
+      if(ltag) { ltag.style.display='none'; ltag.textContent=''; }
+      const prevT = document.getElementById('bm-'+rId);
+      if(prevT) { prevT.style.borderColor=''; prevT.style.background=''; }
+      delete matchAssignments[lId];
     }
   });
-  tracker.log('mc', 'S1-MC-'+id, idx, correct, idx===correct?10:0, 1);
-  const fbId = 'mc' + id + '-feedback';
-  const fb = document.getElementById(fbId);
-  if(idx === correct) {
-    items[idx].classList.add('correct');
-    fb.className = 'code-feedback success';
-    if(id === '12') fb.textContent = '✓ Richtig! Thermoplaste werden beim Erwärmen weich – ideal für den 3D-Druck!';
-    else fb.textContent = '✓ Richtig! Autoreifen sind aus Elastomer – sie sind dehnbar und kehren in die Ursprungsform zurück.';
-    score += 10;
-    document.getElementById('score').textContent = score;
-  } else {
-    items[idx].classList.add('wrong');
-    items[correct].classList.add('correct');
-    fb.className = 'code-feedback error';
-    if(id === '12') fb.textContent = '✗ Leider falsch. Lies nochmal auf S. 350–351 nach.';
-    else fb.textContent = '✗ Leider falsch. Autoreifen sind dehnbar und elastisch – das ist ein Merkmal von Elastomeren (S. 352).';
-  }
-  updateS1Code();
+  matchAssignments[leftId] = rightId;
+  const isCorrect = matchBPairsCorrect[leftId] === rightId;
+  tracker.log('match','S1-B-match-'+leftId, leftId+'->'+rightId, leftId+'->'+matchBPairsCorrect[leftId], 1);
+  // Visual: show abbreviated label on left item
+  const tag = document.getElementById('bm-'+leftId+'-tag');
+  if(tag) { tag.style.display='inline'; tag.textContent='→'; }
+  const leftEl = document.getElementById('bm-'+leftId);
+  if(leftEl) { leftEl.style.borderColor='var(--amber)'; leftEl.style.background='rgba(240,165,0,0.08)'; }
+  const rightEl = document.getElementById('bm-'+rightId);
+  if(rightEl) { rightEl.style.borderColor='var(--amber)'; rightEl.style.background='rgba(240,165,0,0.08)'; rightEl.dataset.assignedBy=leftId; }
+  matchDragState = {};
 }
 
-// Matching
-function buildMatchingA() {
-  const left = [
-    {id:'pet', label:'PET'},
-    {id:'ps', label:'PS (Polystyrol)'},
-    {id:'pvc', label:'PVC'},
-    {id:'hdpe', label:'HDPE'},
-    {id:'pp', label:'PP'},
-  ];
-  const right = [
-    {id:'flaschen', label:'Plastikflaschen & Rohre'},
-    {id:'verp', label:'Lebensmittelverpackungen, Styropor'},
-    {id:'taschen', label:'Plastiktüten, Müllsäcke'},
-    {id:'stuehle', label:'Kinderstühle, Stoßstangen'},
-    {id:'bodenbelag', label:'Fensterrahmen, Bodenbeläge, PVC-Rohre'},
-  ];
-  const matchCorrect = {pet:'verp', ps:'verp2', pvc:'bodenbelag', hdpe:'flaschen', pp:'stuehle'};
-  // Actually: PET = Folien/Flaschen, PS = Styropor, PVC = Fenstererahmen, HDPE = Plastikflaschen, PP = Stühle
-  // Adjust:
-  const matchMap = {
-    'pet': 'pet_r',
-    'ps': 'ps_r',
-    'pvc': 'pvc_r',
-    'hdpe': 'hdpe_r',
-    'pp': 'pp_r'
-  };
-  return `
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0;">
-    <div>
-      <div class="match-col-header">KUNSTSTOFF</div>
-      <div class="match-item" id="m-pet" onclick="matchClick('pet','left')">PET (Polyethylenterephthalat)</div>
-      <div class="match-item" id="m-ps" onclick="matchClick('ps','left')">PS (Polystyrol)</div>
-      <div class="match-item" id="m-pvc" onclick="matchClick('pvc','left')">PVC (Polyvinylchlorid)</div>
-      <div class="match-item" id="m-hdpe" onclick="matchClick('hdpe','left')">HDPE (Polyethen hohe Dichte)</div>
-      <div class="match-item" id="m-pp" onclick="matchClick('pp','left')">PP (Polypropylen)</div>
-    </div>
-    <div>
-      <div class="match-col-header">VERWENDUNG</div>
-      <div class="match-item" id="m-pet_r" onclick="matchClick('pet_r','right')">Folien, Lebensmittelflaschen, PET-Flaschen</div>
-      <div class="match-item" id="m-ps_r" onclick="matchClick('ps_r','right')">Styropor-Verpackungen, Dämmstoffe</div>
-      <div class="match-item" id="m-pvc_r" onclick="matchClick('pvc_r','right')">Fensterrahmen, Rohre, Bodenbeläge</div>
-      <div class="match-item" id="m-hdpe_r" onclick="matchClick('hdpe_r','right')">Reinigungsmittelbehälter, Plastikflaschen</div>
-      <div class="match-item" id="m-pp_r" onclick="matchClick('pp_r','right')">Kindersitze, Stoßstangen, Lebensmittelverp.</div>
-    </div>
-  </div>`;
+function matchDetach(rightId) {
+  // Find which leftId is assigned to this rightId and detach
+  const leftId = Object.entries(matchAssignments).find(([,r]) => r===rightId)?.[0];
+  if(!leftId) return;
+  const tag = document.getElementById('bm-'+leftId+'-tag');
+  if(tag) { tag.style.display='none'; tag.textContent=''; }
+  const leftEl = document.getElementById('bm-'+leftId);
+  if(leftEl) { leftEl.style.borderColor=''; leftEl.style.background=''; }
+  const rightEl = document.getElementById('bm-'+rightId);
+  if(rightEl) { rightEl.style.borderColor=''; rightEl.style.background=''; rightEl.dataset.assignedBy=''; }
+  delete matchAssignments[leftId];
+  // Log detach as no answer
+  tracker.log('match','S1-B-match-'+leftId, 'detached', leftId+'->'+matchBPairsCorrect[leftId], 1);
 }
 
-let matchFirst = null;
-const matchPairs = {pet:'pet_r', ps:'ps_r', pvc:'pvc_r', hdpe:'hdpe_r', pp:'pp_r'};
-
-function matchClick(id, side) {
-  if(s1_matchDone[id]) return;
-  if(!matchFirst) {
-    matchFirst = {id, side};
-    document.getElementById('m-' + id).classList.add('selected');
-  } else {
-    const a = matchFirst;
-    const b = {id, side};
-    if(a.side === b.side) {
-      document.getElementById('m-' + a.id).classList.remove('selected');
-      matchFirst = {id, side};
-      document.getElementById('m-' + id).classList.add('selected');
-      return;
-    }
-    // Check match
-    const leftId = a.side === 'left' ? a.id : b.id;
-    const rightId = a.side === 'right' ? a.id : b.id;
-    const correct = matchPairs[leftId] === rightId;
-    const aEl = document.getElementById('m-' + a.id);
-    const bEl = document.getElementById('m-' + b.id);
-    if(correct) {
-      aEl.classList.add('matched-correct'); aEl.classList.remove('selected');
-      bEl.classList.add('matched-correct');
-      s1_matchDone[a.id] = true; s1_matchDone[b.id] = true;
-      score += 8;
-      document.getElementById('score').textContent = score;
-      const fb = document.getElementById('match-feedback');
-      fb.className = 'code-feedback success';
-      fb.textContent = `✓ Richtig! ${Object.keys(s1_matchDone).length/2}/5 Paare gefunden.`;
-    } else {
-      aEl.classList.add('matched-wrong'); bEl.classList.add('matched-wrong');
-      setTimeout(() => {
-        aEl.classList.remove('matched-wrong','selected');
-        bEl.classList.remove('matched-wrong');
-        const fb = document.getElementById('match-feedback');
-        fb.className = 'code-feedback error';
-        fb.textContent = `✗ Passt leider nicht. Schau ins Kreisdiagramm auf Seite 349.`;
-      }, 700);
-    }
-    matchFirst = null;
-    updateS1Code();
-  }
+function shuffle(arr) {
+  const a = [...arr];
+  for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; }
+  return a;
 }
 
+// NIVEAU B 1.3: toggleCheck (no feedback)
 let b13Checks = {};
 function toggleCheck(el, id) {
   el.classList.toggle('selected');
   b13Checks[id] = el.classList.contains('selected');
-}
-
-function checkB13() {
-  const correct = {b_13_0: true, b_13_1: true, b_13_2: true, b_13_3: true};
-  const container = document.querySelector('.options-list:last-of-type');
-  let c = 0;
-  Object.entries(correct).forEach(([k,v]) => {
-    if(!!b13Checks[k] === v) c++;
-  });
-  const fb = document.getElementById('b13-feedback');
-  if(c === 4) {
-    fb.className = 'code-feedback success';
-    fb.textContent = '✓ Perfekt! Alle vier Aussagen sind korrekt!';
-    score += 15;
-    document.getElementById('score').textContent = score;
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = `${c}/4 richtig. Alle vier Aussagen sind in diesem Fall korrekt – alle ankreuzen!`;
-  }
-  updateS1Code();
-}
-
-function checkC12() {
-  const a = document.getElementById('c12a').value.trim();
-  const b = document.getElementById('c12b').value.trim();
-  const fb = document.getElementById('c12-feedback');
-  const keywords1 = ['Elektronenpaarbindung','Netz','nicht','hitze'];
-  const keywords2 = ['Verknüpfungspunkt','dehnen','zurück','wenig'];
-  const check1 = keywords1.some(k => a.toLowerCase().includes(k.toLowerCase()));
-  const check2 = keywords2.some(k => b.toLowerCase().includes(k.toLowerCase()));
-  if(a.length < 20 || b.length < 20) {
-    fb.className = 'code-feedback error';
-    fb.textContent = 'Bitte schreibe vollständige Antworten (mindestens 1–2 Sätze).';
-    return;
-  }
-  fb.className = 'code-feedback success';
-  fb.textContent = '✓ Antworten gespeichert! Wichtig: Erwähne Elektronenpaarbindungen und Verknüpfungspunkte in deinen finalen Antworten.';
-  score += 20;
-  document.getElementById('score').textContent = score;
-  s1_mcAnswers['c12'] = 1;
-  updateS1Code();
-}
-
-let cSelDone = {};
-function cSelChange() {
-  updateS1Code();
-}
-
-function checkC13() {
-  const answers = {
-    sel1: 'leitet nicht',
-    sel2: 'nur Thermoplaste verformen sich',
-    sel3: 'schwer biologisch abbaubar',
-    sel4: 'leichter'
-  };
-  let correct = 0;
-  for(let k in answers) {
-    const el = document.getElementById(k);
-    if(el && el.value === answers[k]) correct++;
-  }
-  const fb = document.getElementById('c13-feedback');
-  if(correct === 4) {
-    fb.className = 'code-feedback success';
-    fb.textContent = '✓ Ausgezeichnet! Alle Eigenschaften korrekt verglichen.';
-    score += 20; document.getElementById('score').textContent = score;
-    cSelDone['done'] = true;
-    updateS1Code();
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = `${correct}/4 richtig. Tipp: Kunststoffe leiten keine Elektrizität und sind schwer abbaubar.`;
-  }
-}
-
-// ── Code computation for Stage 1 ──
-function computeS1Code() {
-  // Code = 4-stellig
-  // Ziffer 1: Anzahl Thermoplaste richtig sortiert (max 7 → Zahl 0–7)
-  // Ziffer 2: Multiple-Choice korrekt? 1 oder 0
-  // Ziffer 3: Matching / C-Task: Anzahl korrekte Paare
-  // Ziffer 4: Extra (immer 5)
-
-  let d1, d2, d3, d4;
-
-  // D1: Anzahl Thermoplaste richtig einsortiert
-  const thermoCorrect = ['PET','PS','PVC','PP','HDPE','LDPE','PA'];
-  let thermoCount = 0;
-  thermoCorrect.forEach(k => { if(s1_sortAnswers[k] === 'thermo') thermoCount++; });
-  // Map 7→7, 6→6, etc. Capped
-  d1 = thermoCount; // 0-7
-
-  // D2: MC12
-  d2 = (s1_mcAnswers['12'] === 1) ? 1 : 0;
-
-  // D3: 
-  if(niveau === 'A') {
-    d3 = (s1_mcAnswers['13'] === 2) ? 2 : 0;
-  } else if(niveau === 'B') {
-    const pairs = Object.keys(s1_matchDone).filter(k => !k.includes('_r')).length;
-    d3 = pairs; // 0-5
-  } else {
-    d3 = cSelDone['done'] ? 4 : 0;
-  }
-
-  d4 = 5; // Immer 5, "Konstante"
-
-  return [d1, d2, d3, d4];
-}
-
-function computeS1CorrectCode() {
-  if(niveau === 'A') return [7,1,2,5];
-  if(niveau === 'B') return [7,1,5,5]; // d1=7 Thermos, d2=1, d3=5 pairs, d4=5
-  return [7,1,4,5];
-}
-
-function updateS1Code() {
-  const digits = computeS1Code();
-  const correct = computeS1CorrectCode();
-  const display = digits.map((d,i) => d === correct[i] ? String(d) : '?');
-  const area = document.getElementById('s1-code-area');
-  if(!area) return;
-  const allDone = display.every(d => d !== '?');
-  area.innerHTML = `
-    <div class="code-section">
-      <div class="code-header">▶ STAGE-1-CODE // FREISCHALTUNG</div>
-      <div class="code-display">
-        ${display.map(d => `<div class="code-digit ${d!=='?'?'filled':''}">${d==='?'?'_':d}</div>`).join('')}
-      </div>
-      <div class="code-explanation">
-        Code-Schema: [Thermoplaste sortiert] [MC1 korrekt] [Matching/Tabelle] [5]<br>
-        Jede Aufgabe füllt eine Stelle. Löse alle Aufgaben, um den Code zu vervollständigen!
-      </div>
-      <button class="check-btn" onclick="checkS1Code()" ${!allDone?'disabled':''}>
-        CODE PRÜFEN → STAGE 2 FREISCHALTEN
-      </button>
-      <div id="s1-code-feedback" class="code-feedback"></div>
-    </div>`;
-}
-
-function checkS1Code() {
-  const digits = computeS1Code();
-  const correct = computeS1CorrectCode();
-  const ok = digits.every((d,i) => d === correct[i]);
-  const fb = document.getElementById('s1-code-feedback');
-  if(ok) {
-    stage1Code = digits.join('');
-    fb.className = 'code-feedback success';
-    fb.textContent = `✓ CODE AKZEPTIERT! ${digits.join('-')} // WALL-E hat den Müll sortiert! Stage 2 wird freigeschaltet...`;
-    setTimeout(() => showUnlock1(), 1500);
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = `✗ Code noch nicht vollständig. Löse alle Aufgaben korrekt.`;
-  }
-}
-
-function showUnlock1() {
-  document.getElementById('main-content').innerHTML = `
-    <div class="unlock-screen visible">
-      <div class="unlock-icon">📦</div>
-      <div class="unlock-title">STAGE 1 ABGESCHLOSSEN!</div>
-      <div class="unlock-text">
-        WALL-E hat alle Kunststoffe erfolgreich sortiert.<br>
-        <em>"Wheee! Wheee!"</em> – Er dreht freudig seine Augen!<br><br>
-        Code <strong style="color:var(--green);font-family:'Share Tech Mono',monospace;">${stage1Code}</strong> gesichert.<br>
-        Weiter zu <strong>Stage 2: EIGENSCHAFTEN ANALYSIEREN</strong>
-      </div>
-      <button class="next-btn" onclick="renderStage2()">▶ WEITER</button>
-    </div>`;
+  // correct: all 4 true
+  const correctMap = {b_13_0:'true',b_13_1:'true',b_13_2:'true',b_13_3:'false'};
+  tracker.log('check','S1-B-struct-'+id, String(b13Checks[id]||false), correctMap[id]||'true', 1);
 }
 
 // =====================================================================
-// ███████████  STAGE 2: EIGENSCHAFTEN – Tabellen auswerten  ██████████
+// NIVEAU C 1.2: choice-based explanation (no feedback)
+// =====================================================================
+function selectC12(subId, idx, correct) {
+  const container = document.getElementById('c12-opts-'+subId);
+  if(!container) return;
+  container.querySelectorAll('.option-item').forEach(it => it.classList.remove('selected'));
+  container.querySelectorAll('.option-item')[idx].classList.add('selected');
+  tracker.log('mc','S1-C-choice-'+subId, idx, correct, 1);
+}
+
+// NIVEAU C 1.3: table selects
+function logC13Select(fieldId, question, correctVal) {
+  const el = document.getElementById(fieldId);
+  if(!el) return;
+  tracker.log('table','S1-C-Tabelle-'+question, el.value||'—', correctVal, 1);
+}
+
+// =====================================================================
+// S2 MC (no green/red feedback)
 // =====================================================================
 let s2_answers = {};
+function selectS2MC(id, idx, correct, listId) {
+  const container = listId ? document.getElementById(listId) : event.target.closest('.options-list');
+  if(!container) return;
+  container.querySelectorAll('.option-item').forEach(it => it.classList.remove('selected'));
+  container.querySelectorAll('.option-item')[idx].classList.add('selected');
+  s2_answers['mc_'+id] = idx;
+  tracker.log('mc','S2-MC-'+id, idx, correct, 2);
+}
 
+function logRecycle(name, val) {
+  s2_answers['rec_'+name] = val;
+  const rc = {PE:'ja',PF:'nein',PVC:'ja'};
+  tracker.log('recycle','S2-Recycling-'+name, val, rc[name]||'?', 2);
+}
+function logS2Select(fieldId, question, correctVal) {
+  const el = document.getElementById(fieldId);
+  if(!el) return;
+  tracker.log('table','S2-Tabelle-'+question, el.value||'—', correctVal, 2);
+}
+function logProbe(sel, letter, correct) {
+  const el = document.getElementById(sel);
+  if(!el) return;
+  tracker.log('probe','S2-Probe-'+letter, el.value||'—', correct, 2);
+}
+
+// NIVEAU C 2.2: choice explanation
+function selectC22(idx, correct) {
+  const container = document.getElementById('c22-opts');
+  if(!container) return;
+  container.querySelectorAll('.option-item').forEach(it => it.classList.remove('selected'));
+  container.querySelectorAll('.option-item')[idx].classList.add('selected');
+  tracker.log('mc','S2-C-PET-Erkl', idx, correct, 2);
+}
+
+// =====================================================================
+// S3 (no green/red feedback)
+// =====================================================================
+let s3_answers = {};
+let s3_checks = {};
+let s3_sort2 = {};
+let s3_mc31 = {};
+let matchBFirst = null;
+let matchBDone = {};
+
+function selectS3MC(id, idx, correct, listId) {
+  const container = listId ? document.getElementById(listId) : event.target.closest('.options-list');
+  if(!container) return;
+  container.querySelectorAll('.option-item').forEach(it => it.classList.remove('selected'));
+  container.querySelectorAll('.option-item')[idx].classList.add('selected');
+  s3_answers['mc_'+id] = idx;
+  tracker.log('mc','S3-MC-'+id, idx, correct, 3);
+}
+
+function toggleS3Check(el, id) {
+  el.classList.toggle('selected');
+  s3_checks[id] = el.classList.contains('selected');
+  const cm = {e1:'true',e2:'true',e3:'false',e4:'true'};
+  tracker.log('check','S3-Umwelt-'+id, String(s3_checks[id]||false), cm[id]||'?', 3);
+}
+
+function toggleS3MC31(el, key) {
+  el.classList.toggle('selected');
+  s3_mc31[key] = el.classList.contains('selected');
+  if(Object.values(s3_mc31).filter(Boolean).length > 2) {
+    el.classList.remove('selected'); s3_mc31[key] = false;
+  }
+  // Always log all three keys normalized so missing keys default to false
+  const norm = {a:!!s3_mc31.a, b:!!s3_mc31.b, c:!!s3_mc31.c};
+  tracker.log('mc','S3-31-multi', JSON.stringify(norm), '{"a":true,"b":true,"c":false}', 3);
+}
+
+// NIVEAU C 3.1: Drag-drop matching (like B 1.2)
+let matchCDragState = {};
+let matchCAssignments = {};
+const matchCPairsCorrect = {tp:'tp_r', dp:'dp_r', el:'el_r'};
+
+function buildDragMatchC3() {
+  const leftItems = [
+    {id:'tp', label:'Thermoplast'},
+    {id:'dp', label:'Duroplast'},
+    {id:'el', label:'Elastomer'},
+  ];
+  const rightItems = shuffle([
+    {id:'tp_r', label:'Lange, unverzweigte Ketten; Van-der-Waals-Kräfte halten sie zusammen – beim Erwärmen gleiten die Ketten aneinander vorbei'},
+    {id:'dp_r', label:'Engmaschiges, räumliches Netz aus Elektronenpaarbindungen – bleibt auch bei Erwärmen stabil'},
+    {id:'el_r', label:'Wenige Verknüpfungspunkte zwischen langen Ketten – Ketten können bei Belastung vorbeigleiten und kehren zurück'},
+  ]);
+  let html = `<div style="margin:12px 0;">
+    <div class="info-box" style="margin-bottom:12px;">Ziehe die Kunststoffgruppe auf das passende Strukturmerkmal. Klicke eine Verwendung um die Verbindung zu lösen.</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div><div class="match-col-header">KUNSTSTOFFGRUPPE</div>`;
+  leftItems.forEach(it => {
+    html += `<div class="match-item drag-source" id="cm-${it.id}" draggable="true"
+      ondragstart="matchCDragStart(event,'${it.id}')"
+      style="cursor:grab;position:relative;min-height:44px;">
+      ${it.label}
+      <span id="cm-${it.id}-tag" style="display:none;position:absolute;right:6px;top:50%;transform:translateY(-50%);font-size:0.7rem;background:var(--amber);color:#000;border-radius:10px;padding:1px 7px;">→</span>
+    </div>`;
+  });
+  html += `</div><div><div class="match-col-header">STRUKTURMERKMAL</div>`;
+  rightItems.forEach(it => {
+    html += `<div class="match-item drag-target" id="cm-${it.id}" style="min-height:60px;font-size:0.82rem;"
+      ondragover="event.preventDefault();this.classList.add('selected')"
+      ondragleave="this.classList.remove('selected')"
+      ondrop="matchCDrop(event,'${it.id}')"
+      onclick="matchCDetach('${it.id}')">
+      ${it.label}
+    </div>`;
+  });
+  html += `</div></div></div>`;
+  return html;
+}
+
+function matchCDragStart(e, leftId) {
+  matchCDragState.leftId = leftId;
+  e.dataTransfer.setData('text/plain', leftId);
+}
+function matchCDrop(e, rightId) {
+  e.preventDefault();
+  const target = e.target.closest('.drag-target');
+  if(target) target.classList.remove('selected');
+  const leftId = matchCDragState.leftId || e.dataTransfer.getData('text/plain');
+  if(!leftId) return;
+  const prev = matchCAssignments[leftId];
+  if(prev) {
+    const prevEl = document.getElementById('cm-'+prev);
+    if(prevEl) { prevEl.style.borderColor=''; prevEl.style.background=''; }
+  }
+  Object.entries(matchCAssignments).forEach(([lId, rId]) => {
+    if(rId===rightId && lId!==leftId) {
+      const t = document.getElementById('cm-'+lId+'-tag');
+      if(t) { t.style.display='none'; }
+      const p = document.getElementById('cm-'+rId);
+      if(p) { p.style.borderColor=''; p.style.background=''; }
+      delete matchCAssignments[lId];
+    }
+  });
+  matchCAssignments[leftId] = rightId;
+  tracker.log('match','S3-C-struct-'+leftId, leftId+'->'+rightId, leftId+'->'+matchCPairsCorrect[leftId], 3);
+  const tag = document.getElementById('cm-'+leftId+'-tag');
+  if(tag) tag.style.display='inline';
+  const leftEl = document.getElementById('cm-'+leftId);
+  if(leftEl) { leftEl.style.borderColor='var(--amber)'; leftEl.style.background='rgba(240,165,0,0.08)'; }
+  const rightEl = document.getElementById('cm-'+rightId);
+  if(rightEl) { rightEl.style.borderColor='var(--amber)'; rightEl.style.background='rgba(240,165,0,0.08)'; }
+  matchCDragState = {};
+}
+function matchCDetach(rightId) {
+  const leftId = Object.entries(matchCAssignments).find(([,r])=>r===rightId)?.[0];
+  if(!leftId) return;
+  const tag = document.getElementById('cm-'+leftId+'-tag');
+  if(tag) tag.style.display='none';
+  const leftEl = document.getElementById('cm-'+leftId);
+  if(leftEl) { leftEl.style.borderColor=''; leftEl.style.background=''; }
+  const rightEl = document.getElementById('cm-'+rightId);
+  if(rightEl) { rightEl.style.borderColor=''; rightEl.style.background=''; }
+  delete matchCAssignments[leftId];
+  tracker.log('match','S3-C-struct-'+leftId,'detached',leftId+'->'+matchCPairsCorrect[leftId],3);
+}
+
+// NIVEAU C 3.2: choice explanation
+function selectC32(idx, correct) {
+  const container = document.getElementById('c32-opts');
+  if(!container) return;
+  container.querySelectorAll('.option-item').forEach(it => it.classList.remove('selected'));
+  container.querySelectorAll('.option-item')[idx].classList.add('selected');
+  tracker.log('mc','S3-C-PLA-Erkl', idx, correct, 3);
+}
+
+// Stage 3 bio sort
+let draggedChip2 = null;
+function chipDrag2(e, id) { draggedChip2 = id; e.dataTransfer && e.dataTransfer.setData('text/plain', id); }
+function chipDrop2(e, binName) {
+  e.preventDefault();
+  const bin = document.getElementById('bin2-'+binName);
+  bin.classList.remove('drag-over');
+  const chipId = (e.dataTransfer && e.dataTransfer.getData('text/plain')) || draggedChip2;
+  if(!chipId) return;
+  const existing = document.querySelector(`[data-chip="${chipId}"]`);
+  const label = existing ? existing.textContent : chipId;
+  if(existing) { delete s3_sort2[chipId]; existing.remove(); }
+  s3_sort2[chipId] = binName;
+  const bioCorrect = {PLA:'a', PET2:'d', PBAT:'b', PS2:'d'};
+  tracker.log('sort','S3-Bio-'+chipId, binName, bioCorrect[chipId]||'?', 3);
+  const chip = document.createElement('div');
+  chip.className='sort-chip'; chip.style.fontSize='0.75rem';
+  chip.draggable=true; chip.dataset.chip=chipId; chip.textContent=label;
+  chip.addEventListener('dragstart', ev=>{ draggedChip2=chipId; ev.dataTransfer.setData('text/plain',chipId); });
+  chip.addEventListener('click', ()=>{ delete s3_sort2[chipId]; chip.remove(); });
+  bin.appendChild(chip);
+  draggedChip2=null;
+}
+
+// =====================================================================
+// CHECKBOX CHECK SECTION
+// =====================================================================
+let checkboxStates = {};
+function renderCheckSection(containerId, stageKey, label, onProceed) {
+  const el = document.getElementById(containerId);
+  if(!el) return;
+  el.innerHTML = `
+    <div class="code-section">
+      <div class="code-header">▶ ${label}</div>
+      <div style="display:flex;align-items:center;gap:14px;margin:16px 0;">
+        <div id="check-box-${stageKey}" onclick="toggleCheckbox('${stageKey}')"
+          style="width:32px;height:32px;border:2px solid var(--dim);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:1.1rem;cursor:pointer;transition:all 0.2s;flex-shrink:0;"></div>
+        <span style="font-size:0.92rem;color:#c8b880;cursor:pointer;" onclick="toggleCheckbox('${stageKey}')">Ich habe alle Aufgaben dieser Stage bearbeitet.</span>
+      </div>
+      <div style="font-size:0.8rem;color:#777;margin-bottom:16px;font-style:italic;">Hake ab und drücke Weiter – deine Antworten werden automatisch gespeichert.</div>
+      <button class="check-btn" onclick="${onProceed}()" style="width:100%;">✓ WEITER</button>
+    </div>`;
+}
+function toggleCheckbox(key) {
+  checkboxStates[key] = !checkboxStates[key];
+  const box = document.getElementById('check-box-'+key);
+  if(box) {
+    box.textContent = checkboxStates[key] ? '✓' : '';
+    box.style.borderColor = checkboxStates[key] ? 'var(--green)' : 'var(--dim)';
+    box.style.background = checkboxStates[key] ? 'rgba(92,184,92,0.15)' : 'transparent';
+    box.style.color = 'var(--green)';
+  }
+}
+
+// =====================================================================
+// PROCEED FUNCTIONS
+// =====================================================================
+function proceedS1() {
+  logAllSorts();
+  // Finalize B 1.3 checkboxes: log any unchecked items as false
+  if(niveau === 'B') {
+    const b13Map = {b_13_0:'true',b_13_1:'true',b_13_2:'true',b_13_3:'false'};
+    Object.entries(b13Map).forEach(([id, correctVal]) => {
+      tracker.log('check','S1-B-struct-'+id, String(!!b13Checks[id]), correctVal, 1);
+    });
+  }
+  saveProgress();
+  showUnlock1();
+}
+function proceedS2() { saveProgress(); showUnlock2(); }
+function proceedS3() {
+  // Finalize A 3.2 env checkboxes: log unchecked as false
+  if(niveau === 'A') {
+    const envMap = {e1:'true',e2:'true',e3:'false',e4:'true'};
+    Object.entries(envMap).forEach(([id, correctVal]) => {
+      tracker.log('check','S3-Umwelt-'+id, String(!!s3_checks[id]), correctVal, 3);
+    });
+    // Finalize 3.1 multi: ensure all keys present
+    const norm31 = {a:!!s3_mc31.a, b:!!s3_mc31.b, c:!!s3_mc31.c};
+    tracker.log('mc','S3-31-multi', JSON.stringify(norm31), '{"a":true,"b":true,"c":false}', 3);
+  }
+  saveProgress();
+  showFinal();
+}
+
+// =====================================================================
+// STAGE 1
+// =====================================================================
+function renderStage1() {
+  updateProgress(1, 'Sammeln');
+  s1_sortAnswers={}; s1_mcAnswers={}; b13Checks={}; matchAssignments={}; matchDragState={};
+
+  const nBadge = niveau==='A'?'<span class="badge badge-a">NIVEAU A</span>':
+                  niveau==='B'?'<span class="badge badge-b">NIVEAU B</span>':
+                               '<span class="badge badge-c">NIVEAU C</span>';
+
+  let html = `
+  <div class="story-box">
+    <div class="story-tag">▶ MISSIONSBRIEFING // STUFE 1</div>
+    <div class="walle-face">🤖</div>
+    <p class="story-text"><em>"Blubb… Whirrr…"</em><br>
+    WALL-E schiebt sich durch Berge von Müll. Fast alles besteht aus <strong>Kunststoff</strong>! ${nBadge}</p>
+  </div>
+
+  <div class="task-card">
+    <div class="task-header">
+      <div class="task-num">1.1</div><div class="task-title">Kunststoffe sortieren</div>
+      <div class="task-hint">${niveau==='A'?'S. 349':'S. 350–352'}</div>
+    </div>
+    <div class="task-body">Ziehe die Kunststoffe in die richtigen Behälter.
+      <small style="color:#777;display:block;margin-top:4px;">Klicke einen Chip im Behälter um ihn zurückzulegen.</small>
+    </div>
+    <div class="sort-area">
+      <div class="sort-items" id="sort-pool" ondragover="poolDragOver(event)" ondrop="poolDrop(event)">`;
+
+  const chips = niveau==='A'
+    ? [{id:'PET',l:'PET 🍶'},{id:'PS',l:'PS 🥤'},{id:'PVC',l:'PVC 🪟'},{id:'PP',l:'PP 🪑'},
+       {id:'HDPE',l:'HDPE 🧴'},{id:'LDPE',l:'LDPE 🛍️'},{id:'PF',l:'PF 🔌'},{id:'PA',l:'PA 🧵'},{id:'PU',l:'PU 🧽'}]
+    : [{id:'PET',l:'PET'},{id:'PS',l:'PS'},{id:'PVC',l:'PVC'},{id:'PP',l:'PP'},
+       {id:'HDPE',l:'HDPE'},{id:'LDPE',l:'LDPE'},{id:'PF',l:'PF'},{id:'PA',l:'PA'},{id:'PU',l:'PU'}];
+
+  chips.forEach(c => {
+    html += `<div class="sort-chip" draggable="true" data-chip="${c.id}" ondragstart="chipDrag(event,'${c.id}')">${c.l}</div>`;
+  });
+
+  const binIcon = niveau==='A';
+  html += `</div><div class="bins-row">
+    <div class="bin" id="bin-thermo" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop(event,'thermo')">
+      ${binIcon?'<div class="bin-icon">♻️</div>':''}<div class="bin-label">THERMOPLASTE</div>
+    </div>
+    <div class="bin" id="bin-duro" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop(event,'duro')">
+      ${binIcon?'<div class="bin-icon">🔩</div>':''}<div class="bin-label">DUROPLASTE</div>
+    </div>
+    <div class="bin" id="bin-elasto" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop(event,'elasto')">
+      ${binIcon?'<div class="bin-icon">🔵</div>':''}<div class="bin-label">ELASTOMERE</div>
+    </div>
+  </div></div></div>`;
+
+  // ── 1.2 + 1.3 per niveau ──
+  if(niveau==='A') {
+    html += `
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">1.2</div><div class="task-title">Eigenschaften erkennen</div><div class="task-hint">S. 350–351</div></div>
+      <div class="task-body">Welche Aussage beschreibt <strong>Thermoplaste</strong> richtig?</div>
+      <div class="options-list">
+        <div class="option-item" onclick="selectMC('12',0,1)"><div class="option-radio"></div>Thermoplaste sind hitzebeständig und lassen sich nicht formen.</div>
+        <div class="option-item" onclick="selectMC('12',1,1)"><div class="option-radio"></div>Thermoplaste werden beim Erwärmen weich und können geformt werden.</div>
+        <div class="option-item" onclick="selectMC('12',2,1)"><div class="option-radio"></div>Thermoplaste sind stark elastisch wie Gummibänder.</div>
+        <div class="option-item" onclick="selectMC('12',3,1)"><div class="option-radio"></div>Thermoplaste sind immer biologisch abbaubar.</div>
+      </div>
+    </div>
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">1.3</div><div class="task-title">WALL-E fragt: Was ist das?</div><div class="task-hint">S. 352</div></div>
+      <div class="task-body">WALL-E findet einen Autoreifen. Aus welcher Kunststoffgruppe besteht er?</div>
+      <div class="options-list">
+        <div class="option-item" onclick="selectMC('13',0,2)"><div class="option-radio"></div>Thermoplast</div>
+        <div class="option-item" onclick="selectMC('13',1,2)"><div class="option-radio"></div>Duroplast</div>
+        <div class="option-item" onclick="selectMC('13',2,2)"><div class="option-radio"></div>Elastomer</div>
+      </div>
+    </div>`;
+
+  } else if(niveau==='B') {
+    html += `
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">1.2</div><div class="task-title">Matching: Kunststoff ↔ Verwendung</div><div class="task-hint">S. 349</div></div>
+      ${buildDragMatchB()}
+    </div>
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">1.3</div><div class="task-title">Innerer Aufbau – Aussagen bewerten</div><div class="task-hint">S. 350–352</div></div>
+      <div class="task-body">Wähle alle zutreffenden Aussagen zum inneren Aufbau der Kunststoffe:</div>
+      <div class="options-list">
+        <div class="option-item" onclick="toggleCheck(this,'b_13_0')"><div class="option-radio"></div>Thermoplaste haben lange, unverzweigte Ketten, die aneinander vorbeigleiten können.</div>
+        <div class="option-item" onclick="toggleCheck(this,'b_13_1')"><div class="option-radio"></div>Duroplaste haben ein engmaschiges 3D-Netz aus Elektronenpaarbindungen.</div>
+        <div class="option-item" onclick="toggleCheck(this,'b_13_2')"><div class="option-radio"></div>Elastomere sind wenig vernetzt und können sich dehnen.</div>
+        <div class="option-item" onclick="toggleCheck(this,'b_13_3')"><div class="option-radio"></div>Alle Kunststoffe bestehen aus Monomeren.</div>
+      </div>
+    </div>`;
+
+  } else {
+    // NIVEAU C
+    html += `
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">1.2</div><div class="task-title">Kunststoff-Struktur erklären</div><div class="task-hint">S. 350–352</div></div>
+      <div class="task-body">Wähle für jede Frage die treffendste Erklärung.</div>
+
+      <div class="info-box" style="margin-bottom:8px;"><strong>1.2a:</strong> Warum wird ein Duroplast-Kochlöffel beim Kochen nicht weich?</div>
+      <div class="options-list" id="c12-opts-a">
+        <div class="option-item" onclick="selectC12('a',0,0)"><div class="option-radio"></div>Duroplaste besitzen ein engmaschiges, räumliches Netz aus Elektronenpaarbindungen, das auch beim Erwärmen bestehen bleibt und die Moleküle fest an ihrem Platz hält.</div>
+        <div class="option-item" onclick="selectC12('a',1,0)"><div class="option-radio"></div>Duroplaste haben sehr lange Molekülketten, die beim Erwärmen so stark schwingen, dass sie sich nicht mehr bewegen können.</div>
+        <div class="option-item" onclick="selectC12('a',2,0)"><div class="option-radio"></div>Duroplaste schmelzen bei sehr hohen Temperaturen, aber beim normalen Kochen ist die Wärme noch nicht ausreichend, um das Material zu verformen.</div>
+      </div>
+
+      <div class="info-box" style="margin:12px 0 8px;"><strong>1.2b:</strong> Warum kehrt ein Gummiring nach dem Dehnen in seine ursprüngliche Form zurück?</div>
+      <div class="options-list" id="c12-opts-b">
+        <div class="option-item" onclick="selectC12('b',0,1)"><div class="option-radio"></div>Elastomere haben sehr viele Verknüpfungspunkte zwischen den Ketten, die wie Anker wirken und das Zurückziehen erzwingen.</div>
+        <div class="option-item" onclick="selectC12('b',1,1)"><div class="option-radio"></div>Elastomere haben wenige Verknüpfungspunkte zwischen langen Ketten; die Ketten können unter Belastung aneinander vorbeigleiten, werden aber durch die Verknüpfungspunkte in ihre Ausgangslage zurückgezogen.</div>
+        <div class="option-item" onclick="selectC12('b',2,1)"><div class="option-radio"></div>Elastomere bestehen aus kurzen Ketten ohne Verknüpfungspunkte, die beim Dehnen auseinandergedrückt werden und beim Loslassen durch den Luftdruck zurückschnellen.</div>
+      </div>
+    </div>
+
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">1.3</div><div class="task-title">Metalle vs. Kunststoffe – Vergleich</div><div class="task-hint">S. 347 + 353</div></div>
+      <div class="task-body">Ergänze die Tabelle mit den Eigenschaften von Kunststoffen im Vergleich zu Metallen:</div>
+      <table class="prop-table">
+        <tr><th>Eigenschaft</th><th>Metalle</th><th>Kunststoffe</th></tr>
+        <tr><td>Elektrische Leitfähigkeit</td><td class="highlight">leitet</td><td>
+          <select id="sel1" onchange="logC13Select('sel1','Leitf','leitet nicht')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px 8px;border-radius:4px;font-size:0.82rem;">
+            <option value="">—</option><option>leitet nicht</option><option>leitet immer</option><option>leitet manchmal</option>
+          </select></td></tr>
+        <tr><td>Verformbarkeit bei Wärme</td><td class="highlight">schmilzt bei hohen Temp.</td><td>
+          <select id="sel2" onchange="logC13Select('sel2','Verform','nur Thermoplaste verformen sich')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px 8px;border-radius:4px;font-size:0.82rem;">
+            <option value="">—</option><option>nur Thermoplaste verformen sich</option><option>alle verformen sich</option><option>keiner verformt sich</option>
+          </select></td></tr>
+        <tr><td>Biologischer Abbau</td><td class="highlight">rosten, oxidieren</td><td>
+          <select id="sel3" onchange="logC13Select('sel3','Abbau','schwer biologisch abbaubar')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px 8px;border-radius:4px;font-size:0.82rem;">
+            <option value="">—</option><option>schwer biologisch abbaubar</option><option>leicht biologisch abbaubar</option><option>gar nicht abbaubar</option>
+          </select></td></tr>
+        <tr><td>Gewicht</td><td class="highlight">schwer</td><td>
+          <select id="sel4" onchange="logC13Select('sel4','Gewicht','leichter')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px 8px;border-radius:4px;font-size:0.82rem;">
+            <option value="">—</option><option>leichter</option><option>gleich schwer</option><option>schwerer</option>
+          </select></td></tr>
+      </table>
+    </div>`;
+  }
+
+  html += `<div id="s1-code-area"></div>`;
+  document.getElementById('main-content').innerHTML = html;
+  renderCheckSection('s1-code-area','s1','STAGE 1 ABSCHLIESSEN','proceedS1');
+}
+
+// =====================================================================
+// STAGE 2
+// =====================================================================
 function renderStage2() {
   updateProgress(2, 'Analysieren');
   s2_answers = {};
@@ -1348,26 +1444,15 @@ function renderStage2() {
   <div class="story-box">
     <div class="story-tag">▶ MISSIONSBRIEFING // STUFE 2</div>
     <div class="walle-face">🤖</div>
-    <p class="story-text">
-      <em>"Eeeeeva!"</em><br>
-      WALL-E hat die Kunststoffe getrennt, aber die Recyclingstation braucht mehr Infos.
-      Welche Temperatur hält ein Kunststoff aus? Wie bricht er? Löst er sich in Benzin?
-      WALL-E scannt die Proben – doch du musst die <strong>Messdaten auswerten</strong>!
-    </p>
+    <p class="story-text"><em>"Eeeeeva!"</em><br>
+    WALL-E hat die Kunststoffe getrennt – aber die Recyclingstation braucht mehr Infos. Du musst die <strong>Messdaten auswerten</strong>!</p>
   </div>`;
 
-  // ──── AUFGABE 2.1: Tabellen-Auswertung ────────────────────────────
-  if(niveau === 'A') {
+  if(niveau==='A') {
     html += `
     <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">2.1</div>
-        <div class="task-title">Tabellen-Detektiv</div>
-        <div class="task-hint">S. 353 – Tabelle M2</div>
-      </div>
-      <div class="task-body">
-        Schaue in die Tabelle „Arten von Kunststoffen" (S. 353). Beantworte diese Fragen:
-      </div>
+      <div class="task-header"><div class="task-num">2.1</div><div class="task-title">Tabellen-Detektiv</div><div class="task-hint">S. 353 – Tabelle M2</div></div>
+      <div class="task-body">Beantworte die Fragen zur Tabelle auf S. 353.</div>
       <table class="prop-table">
         <tr><th>Kunststoff</th><th>Bruchverhalten</th><th>Schmelzbereich</th></tr>
         <tr><td>PE</td><td>biegsam</td><td>105–120 °C</td></tr>
@@ -1377,1028 +1462,433 @@ function renderStage2() {
         <tr><td>PA</td><td>hart, bruchfest</td><td>185–255 °C</td></tr>
         <tr><td>PF</td><td>hart, bruchfest</td><td>—</td></tr>
       </table>
-
-      <div class="info-box"><strong>Frage 2.1a:</strong> Welcher Kunststoff hat den niedrigsten Schmelzbereich?</div>
+      <div class="info-box"><strong>2.1a:</strong> Welcher Kunststoff hat den niedrigsten Schmelzbereich?</div>
       <div class="options-list" id="opts-21a">
-        <div class="option-item" onclick="selectS2MC('21a',0,2,'opts-21a','mc-21a-fb')"><div class="option-radio"></div>PE (105–120 °C)</div>
-        <div class="option-item" onclick="selectS2MC('21a',1,2,'opts-21a','mc-21a-fb')"><div class="option-radio"></div>PET (240–260 °C)</div>
-        <div class="option-item" onclick="selectS2MC('21a',2,2,'opts-21a','mc-21a-fb')"><div class="option-radio"></div>PVC (75–110 °C)</div>
-        <div class="option-item" onclick="selectS2MC('21a',3,2,'opts-21a','mc-21a-fb')"><div class="option-radio"></div>PA (185–255 °C)</div>
+        <div class="option-item" onclick="selectS2MC('21a',0,2,'opts-21a')"><div class="option-radio"></div>PE (105–120 °C)</div>
+        <div class="option-item" onclick="selectS2MC('21a',1,2,'opts-21a')"><div class="option-radio"></div>PET (240–260 °C)</div>
+        <div class="option-item" onclick="selectS2MC('21a',2,2,'opts-21a')"><div class="option-radio"></div>PVC (75–110 °C)</div>
+        <div class="option-item" onclick="selectS2MC('21a',3,2,'opts-21a')"><div class="option-radio"></div>PA (185–255 °C)</div>
       </div>
-      <div id="mc-21a-fb" class="code-feedback"></div>
-
-      <div class="info-box" style="margin-top:10px;"><strong>Frage 2.1b:</strong> Warum hat PF (Phenolharz) keinen Schmelzbereich in der Tabelle?</div>
+      <div class="info-box" style="margin-top:10px;"><strong>2.1b:</strong> Warum hat PF keinen Schmelzbereich in der Tabelle?</div>
       <div class="options-list" id="opts-21b">
-        <div class="option-item" onclick="selectS2MC('21b',0,0,'opts-21b','mc-21b-fb')"><div class="option-radio"></div>Weil PF ein Duroplast ist und sich nicht schmelzen lässt.</div>
-        <div class="option-item" onclick="selectS2MC('21b',1,0,'opts-21b','mc-21b-fb')"><div class="option-radio"></div>Weil PF noch nicht gemessen wurde.</div>
-        <div class="option-item" onclick="selectS2MC('21b',2,0,'opts-21b','mc-21b-fb')"><div class="option-radio"></div>Weil PF nur aus Monomeren besteht.</div>
+        <div class="option-item" onclick="selectS2MC('21b',0,0,'opts-21b')"><div class="option-radio"></div>Weil PF ein Duroplast ist und sich nicht schmelzen lässt.</div>
+        <div class="option-item" onclick="selectS2MC('21b',1,0,'opts-21b')"><div class="option-radio"></div>Weil PF noch nicht gemessen wurde.</div>
+        <div class="option-item" onclick="selectS2MC('21b',2,0,'opts-21b')"><div class="option-radio"></div>Weil PF nur aus Monomeren besteht.</div>
       </div>
-      <div id="mc-21b-fb" class="code-feedback"></div>
     </div>
-
     <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">2.2</div>
-        <div class="task-title">WALL-Es Recycling-Entscheidung</div>
-        <div class="task-hint">S. 349 + 353</div>
-      </div>
-      <div class="task-body">
-        WALL-E muss entscheiden: Können diese Kunststoffe wiederverwertet (recycelt) werden?
-        Wähle für jeden Kunststoff die richtige Antwort.
-      </div>
-      ${buildRecycleQ('PE','biegsam, recycelbar','Thermoplast','ja')}
-      ${buildRecycleQ('PF','hart, bruchfest, kein Schmelzpunkt','Duroplast – kein Recycling durch Schmelzen','nein')}
-      ${buildRecycleQ('PVC','biegsam, Schmelzpunkt 75–110°C','Thermoplast','ja')}
-      <div id="recycle-fb" class="code-feedback"></div>
-      <button class="check-btn" onclick="checkRecycle()" style="margin-top:10px;">RECYCLING PRÜFEN</button>
+      <div class="task-header"><div class="task-num">2.2</div><div class="task-title">WALL-Es Recycling-Entscheidung</div><div class="task-hint">S. 349 + 353</div></div>
+      <div class="task-body">Können diese Kunststoffe recycelt werden?</div>
+      ${buildRecycleQ('PE','biegsam, Thermoplast','ja')}
+      ${buildRecycleQ('PF','hart, kein Schmelzpunkt, Duroplast','nein')}
+      ${buildRecycleQ('PVC','biegsam, Schmelzpunkt 75–110°C, Thermoplast','ja')}
     </div>`;
-  } else if(niveau === 'B') {
+
+  } else if(niveau==='B') {
     html += `
     <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">2.1</div>
-        <div class="task-title">Eigenschaften-Tabelle ergänzen</div>
-        <div class="task-hint">S. 353 M2</div>
-      </div>
-      <div class="task-body">
-        Ergänze die fehlenden Eigenschaften aus der Tabelle (S. 353). 
-        WALL-Es Scanner benötigt vollständige Daten!
-      </div>
+      <div class="task-header"><div class="task-num">2.1</div><div class="task-title">Eigenschaften-Tabelle ergänzen</div><div class="task-hint">S. 353 M2</div></div>
+      <div class="task-body">Ergänze die fehlenden Werte aus der Tabelle.</div>
       <table class="prop-table">
-        <tr><th>Kunststoff</th><th>Bruchverhalten</th><th>Lösemittelstabilität</th><th>Verhalten in Flamme</th></tr>
+        <tr><th>Kunststoff</th><th>Bruchverhalten</th><th>Lösemittelstab.</th><th>Flamme</th></tr>
         <tr><td>PE</td><td>biegsam</td><td>
-          <select id="b21_pe" onchange="updateS2Code()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
+          <select id="b21_pe" onchange="logS2Select('b21_pe','pe','stabil')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
             <option value="">—</option><option>stabil</option><option>löslich</option><option>instabil, klebt</option>
           </select></td><td>gelbe Flamme, blauer Kern</td></tr>
         <tr><td>PET</td><td>biegsam</td><td>löslich</td><td>
-          <select id="b21_pet" onchange="updateS2Code()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
+          <select id="b21_pet" onchange="logS2Select('b21_pet','pet','orange-gelbe Flamme, tropft, rußt')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
             <option value="">—</option><option>orange-gelbe Flamme, tropft, rußt</option><option>brennt blau</option><option>rußt stark</option>
           </select></td></tr>
         <tr><td>PS</td><td>
-          <select id="b21_ps" onchange="updateS2Code()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
+          <select id="b21_ps" onchange="logS2Select('b21_ps','ps','hart, zerbrechlich')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
             <option value="">—</option><option>hart, zerbrechlich</option><option>biegsam</option><option>hart, bruchfest</option>
           </select></td><td>instabil, klebt</td><td>brennt flackernd, rußt stark</td></tr>
         <tr><td>PA</td><td>hart, bruchfest</td><td>stabil</td><td>
-          <select id="b21_pa" onchange="updateS2Code()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
+          <select id="b21_pa" onchange="logS2Select('b21_pa','pa','orange-gelbe Flamme, tropft fadenziehend')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
             <option value="">—</option><option>orange-gelbe Flamme, tropft fadenziehend</option><option>grüne Flamme</option><option>keine Flamme</option>
           </select></td></tr>
       </table>
-      <button class="check-btn" onclick="checkB21()" style="margin-top:10px;">TABELLE PRÜFEN</button>
-      <div id="b21-feedback" class="code-feedback"></div>
     </div>
-
     <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">2.2</div>
-        <div class="task-title">Diagramm auswerten – Bedarf an Kunststoffen</div>
-        <div class="task-hint">S. 349 M5</div>
-      </div>
-      <div class="task-body">
-        Schaue dir das Diagramm auf S. 349 an (Bedarf an Kunststoffen). Beantworte:
-      </div>
-      <div class="info-box"><strong>2.2a:</strong> Von 1950 bis 2020 – wie hat sich die weltweite Produktion verändert?</div>
+      <div class="task-header"><div class="task-num">2.2</div><div class="task-title">Diagramm auswerten</div><div class="task-hint">S. 349 M5</div></div>
+      <div class="task-body">Schaue dir das Diagramm auf S. 349 an.</div>
+      <div class="info-box"><strong>2.2a:</strong> Wie hat sich die Weltproduktion von 1950 bis 2020 verändert?</div>
       <div class="options-list" id="opts-22a">
-        <div class="option-item" onclick="selectS2MC('22a',0,2,'opts-22a','mc22a-fb')"><div class="option-radio"></div>Sie ist gleichgeblieben.</div>
-        <div class="option-item" onclick="selectS2MC('22a',1,2,'opts-22a','mc22a-fb')"><div class="option-radio"></div>Sie ist gesunken.</div>
-        <div class="option-item" onclick="selectS2MC('22a',2,2,'opts-22a','mc22a-fb')"><div class="option-radio"></div>Sie ist stark angestiegen (von 0,35 auf 367 Mio. Tonnen).</div>
+        <div class="option-item" onclick="selectS2MC('22a',0,2,'opts-22a')"><div class="option-radio"></div>Sie ist gleichgeblieben.</div>
+        <div class="option-item" onclick="selectS2MC('22a',1,2,'opts-22a')"><div class="option-radio"></div>Sie ist gesunken.</div>
+        <div class="option-item" onclick="selectS2MC('22a',2,2,'opts-22a')"><div class="option-radio"></div>Sie ist stark angestiegen (von 0,35 auf 367 Mio. Tonnen).</div>
       </div>
-      <div id="mc22a-fb" class="code-feedback"></div>
-      <div class="info-box" style="margin-top:10px;"><strong>2.2b:</strong> Europas Anteil an der Weltproduktion: Was fällt auf?</div>
+      <div class="info-box" style="margin-top:10px;"><strong>2.2b:</strong> Was fällt am europäischen Anteil auf?</div>
       <div class="options-list" id="opts-22b">
-        <div class="option-item" onclick="selectS2MC('22b',0,0,'opts-22b','mc22b-fb')"><div class="option-radio"></div>Europa produziert deutlich weniger als die Welt insgesamt.</div>
-        <div class="option-item" onclick="selectS2MC('22b',1,0,'opts-22b','mc22b-fb')"><div class="option-radio"></div>Europa produziert genauso viel wie der Rest der Welt.</div>
-        <div class="option-item" onclick="selectS2MC('22b',2,0,'opts-22b','mc22b-fb')"><div class="option-radio"></div>Europa produziert mehr als die Welt insgesamt.</div>
+        <div class="option-item" onclick="selectS2MC('22b',0,0,'opts-22b')"><div class="option-radio"></div>Europa produziert deutlich weniger als die Welt insgesamt.</div>
+        <div class="option-item" onclick="selectS2MC('22b',1,0,'opts-22b')"><div class="option-radio"></div>Europa produziert genauso viel wie der Rest der Welt.</div>
+        <div class="option-item" onclick="selectS2MC('22b',2,0,'opts-22b')"><div class="option-radio"></div>Europa produziert mehr als die Welt insgesamt.</div>
       </div>
-      <div id="mc22b-fb" class="code-feedback"></div>
     </div>`;
+
   } else {
-    // Niveau C
+    // NIVEAU C
     html += `
     <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">2.1</div>
-        <div class="task-title">Kunststoff-Identifikation aus Eigenschaften</div>
-        <div class="task-hint">S. 352–353</div>
-      </div>
-      <div class="task-body">
-        WALL-E hat 3 unbekannte Proben gefunden. Bestimme sie anhand der gemessenen Eigenschaften.
-      </div>
+      <div class="task-header"><div class="task-num">2.1</div><div class="task-title">Kunststoff-Identifikation</div><div class="task-hint">S. 352–353</div></div>
+      <div class="task-body">Bestimme die unbekannten Proben aus den Messdaten.</div>
       <table class="prop-table">
         <tr><th>Probe</th><th>Bruchverhalten</th><th>Flamme</th><th>Schmelzbereich</th><th>Kunststoff?</th></tr>
-        <tr>
-          <td><strong>Probe α</strong></td><td>biegsam</td><td>gelbe Flamme, blauer Kern, tropft</td><td>105–120 °C</td>
-          <td><select id="c21_a" onchange="updateS2Code()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
-            <option value="">—wählen—</option><option>PE</option><option>PET</option><option>PS</option><option>PVC</option><option>PA</option><option>PF</option>
-          </select></td>
-        </tr>
-        <tr>
-          <td><strong>Probe β</strong></td><td>hart, bruchfest</td><td>helle, rußende Flamme</td><td>—</td>
-          <td><select id="c21_b" onchange="updateS2Code()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
-            <option value="">—wählen—</option><option>PE</option><option>PET</option><option>PS</option><option>PVC</option><option>PA</option><option>PF</option>
-          </select></td>
-        </tr>
-        <tr>
-          <td><strong>Probe γ</strong></td><td>biegsam</td><td>gelbe Flamme, grüner Saum, rußt</td><td>75–110 °C</td>
-          <td><select id="c21_g" onchange="updateS2Code()" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
-            <option value="">—wählen—</option><option>PE</option><option>PET</option><option>PS</option><option>PVC</option><option>PA</option><option>PF</option>
-          </select></td>
-        </tr>
+        <tr><td><strong>α</strong></td><td>biegsam</td><td>gelbe Flamme, blauer Kern, tropft</td><td>105–120 °C</td>
+          <td><select id="c21_a" onchange="logProbe('c21_a','α','PE')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
+            <option value="">—</option><option>PE</option><option>PET</option><option>PS</option><option>PVC</option><option>PA</option><option>PF</option>
+          </select></td></tr>
+        <tr><td><strong>β</strong></td><td>hart, bruchfest</td><td>helle, rußende Flamme</td><td>—</td>
+          <td><select id="c21_b" onchange="logProbe('c21_b','β','PF')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
+            <option value="">—</option><option>PE</option><option>PET</option><option>PS</option><option>PVC</option><option>PA</option><option>PF</option>
+          </select></td></tr>
+        <tr><td><strong>γ</strong></td><td>biegsam</td><td>gelbe Flamme, grüner Saum, rußt</td><td>75–110 °C</td>
+          <td><select id="c21_g" onchange="logProbe('c21_g','γ','PVC')" style="background:#1a140a;border:1px solid var(--dim);color:var(--sand);padding:4px;border-radius:4px;font-size:0.8rem;">
+            <option value="">—</option><option>PE</option><option>PET</option><option>PS</option><option>PVC</option><option>PA</option><option>PF</option>
+          </select></td></tr>
       </table>
-      <button class="check-btn" onclick="checkC21()" style="margin-top:10px;">PROBEN BESTIMMEN</button>
-      <div id="c21-feedback" class="code-feedback"></div>
     </div>
-
     <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">2.2</div>
-        <div class="task-title">Thermoplast oder Duroplast? – Begründen</div>
-        <div class="task-hint">S. 350–353</div>
+      <div class="task-header"><div class="task-num">2.2</div><div class="task-title">Thermoplast oder Duroplast? – Begründen</div><div class="task-hint">S. 350–353</div></div>
+      <div class="task-body">Warum eignet sich PET für Getränkeflaschen, aber nicht für Kochtöpfe? Wähle die treffendste Erklärung:</div>
+      <div class="options-list" id="c22-opts">
+        <div class="option-item" onclick="selectC22(0,2)"><div class="option-radio"></div>PET ist ein Thermoplast mit einem Schmelzbereich von 240–260 °C; beim Kochen werden diese Temperaturen nicht erreicht, weshalb PET für Flaschen geeignet ist, aber nicht für Kochtöpfe, die direktem Herd-Feuer ausgesetzt werden.</div>
+        <div class="option-item" onclick="selectC22(1,2)"><div class="option-radio"></div>PET ist ein Duroplast, der sich bei Wärme nicht verformt; für Kochtöpfe wird jedoch ein Material benötigt, das Wärme leitet, weshalb Metall besser geeignet ist.</div>
+        <div class="option-item" onclick="selectC22(2,2)"><div class="option-radio"></div>PET ist ein Thermoplast, der beim Erwärmen weich wird; Getränkeflaschen sind daher unproblematisch, da sie nie erhitzt werden, während Kochtöpfe hohe Temperaturen erreichen, bei denen PET schmilzt und sich zersetzt.</div>
       </div>
-      <div class="task-body">
-        WALL-E fragt: Warum eignet sich PET für Getränkeflaschen, aber nicht für Kochtöpfe?
-        Nutze Eigenschaften aus der Tabelle (S. 353) und Strukturwissen (S. 350–352).
-      </div>
-      <textarea id="c22text" style="width:100%;background:#0f0c06;border:1px solid var(--dim);border-radius:6px;color:#c8b880;padding:10px;font-family:'Nunito',sans-serif;font-size:0.88rem;min-height:100px;margin:10px 0;" placeholder="PET ist ein Thermoplast, weil… Für Kochtöpfe eignet sich PET nicht, weil… Stattdessen würde man… verwenden."></textarea>
-      <button class="check-btn" onclick="checkC22()">ANTWORT EINREICHEN</button>
-      <div id="c22-feedback" class="code-feedback"></div>
     </div>`;
   }
 
   html += `<div id="s2-code-area"></div>`;
   document.getElementById('main-content').innerHTML = html;
-  updateS2Code();
+  renderCheckSection('s2-code-area','s2','STAGE 2 ABSCHLIESSEN','proceedS2');
 }
 
-// ── Recycle checkboxes (Niveau A) ──
-function buildRecycleQ(name, desc, type, correct) {
+function buildRecycleQ(name, desc, correct) {
   return `
   <div style="background:#1a140a;border:1px solid var(--dim);border-radius:8px;padding:12px;margin:8px 0;">
-    <div style="font-weight:700;color:var(--sand);margin-bottom:6px;">${name} – ${desc}</div>
-    <div style="font-size:0.82rem;color:#888;margin-bottom:8px;">${type}</div>
-    <div style="display:flex;gap:12px;">
+    <div style="font-weight:700;color:var(--sand);margin-bottom:4px;">${name} – ${desc}</div>
+    <div style="display:flex;gap:12px;margin-top:8px;">
       <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.85rem;">
-        <input type="radio" name="rec_${name}" value="ja" onchange="s2_answers['rec_${name}']=this.value;updateS2Code()" style="accent-color:var(--green);"> ✓ Kann recycelt werden
+        <input type="radio" name="rec_${name}" value="ja" onchange="logRecycle('${name}',this.value)" style="accent-color:var(--green);"> ✓ recycelbar
       </label>
       <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.85rem;">
-        <input type="radio" name="rec_${name}" value="nein" onchange="s2_answers['rec_${name}']=this.value;updateS2Code()" style="accent-color:var(--red);"> ✗ Kann nicht recycelt werden
+        <input type="radio" name="rec_${name}" value="nein" onchange="logRecycle('${name}',this.value)" style="accent-color:var(--red);"> ✗ nicht recycelbar
       </label>
     </div>
   </div>`;
 }
 
-function checkRecycle() {
-  const correct = {rec_PE:'ja', rec_PF:'nein', rec_PVC:'ja'};
-  let c = 0;
-  for(let k in correct) {
-    const isOk = s2_answers[k] === correct[k];
-    if(isOk) c++;
-    tracker.log('recycle', 'S2-Recycling-'+k, s2_answers[k]||'—', correct[k], isOk?5:0, 2);
-  }
-  const fb = document.getElementById('recycle-fb');
-  if(c === 3) {
-    fb.className = 'code-feedback success';
-    fb.textContent = '✓ Richtig! PE und PVC sind Thermoplaste und können durch Schmelzen recycelt werden. PF (Duroplast) nicht!';
-    score += 15; document.getElementById('score').textContent = score;
-    s2_answers['recycle_done'] = true;
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = `${c}/3 richtig. Duroplaste können nicht durch Schmelzen recycelt werden – ihr Netz bleibt stabil.`;
-  }
-  updateS2Code();
-}
+// =====================================================================
+// STAGE 3
+// =====================================================================
+function renderStage3() {
+  updateProgress(3, 'Recycling');
+  s3_answers={}; s3_checks={}; s3_sort2={}; s3_mc31={}; matchBFirst=null; matchBDone={}; matchCAssignments={}; matchCDragState={};
 
-function selectS2MC(id, idx, correct, listId, fbId) {
-  const container = listId ? document.getElementById(listId) : event.target.closest('.options-list');
-  if(!container) return;
-  const items = container.querySelectorAll('.option-item');
-  items.forEach(it => it.classList.remove('selected','correct','wrong'));
-  items[idx].classList.add('selected');
-  s2_answers['mc_'+id] = idx;
-  const isCorrect = idx === correct;
-  tracker.log('mc', 'S2-MC-'+id, idx, correct, isCorrect ? 8 : 0, 2);
-  const fb = fbId ? document.getElementById(fbId) : null;
-  if(isCorrect) {
-    items[idx].classList.add('correct');
-    score += 8; document.getElementById('score').textContent = score;
-    if(fb) { fb.className='code-feedback success'; fb.textContent='✓ Richtig!'; }
-  } else {
-    items[idx].classList.add('wrong');
-    if(items[correct]) items[correct].classList.add('correct');
-    if(fb) { fb.className='code-feedback error'; fb.textContent='✗ Nicht ganz – die richtige Antwort ist grün markiert.'; }
-  }
-  updateS2Code();
-}
+  let html = `
+  <div class="story-box">
+    <div class="story-tag">▶ FINALE MISSION // STUFE 3</div>
+    <div class="walle-face">🌍</div>
+    <p class="story-text">WALL-E steht vor der Recyclingstation. Letzte Frage: <strong>Warum ist Plastik ein Umweltproblem?</strong></p>
+  </div>`;
 
-let b21done = false;
-function checkB21() {
-  const answers = {b21_pe:'stabil', b21_pet:'orange-gelbe Flamme, tropft, rußt', b21_ps:'hart, zerbrechlich', b21_pa:'orange-gelbe Flamme, tropft fadenziehend'};
-  let c = 0;
-  for(let k in answers) {
-    const el = document.getElementById(k);
-    const val = el ? el.value : '';
-    const isOk = val === answers[k];
-    if(isOk) c++;
-    tracker.log('table', 'S2-Tabelle-'+k, val||'—', answers[k], isOk?5:0, 2);
-  }
-  const fb = document.getElementById('b21-feedback');
-  if(c === 4) {
-    fb.className = 'code-feedback success';
-    fb.textContent = '✓ Perfekt! Alle Tabellenwerte korrekt ergänzt!';
-    score += 20; document.getElementById('score').textContent = score;
-    b21done = true;
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = `${c}/4 richtig. Überprüfe S. 353 nochmal.`;
-  }
-  updateS2Code();
-}
-
-let c21done = false;
-function checkC21() {
-  const a = document.getElementById('c21_a').value;
-  const b = document.getElementById('c21_b').value;
-  const g = document.getElementById('c21_g').value;
-  tracker.log('probe', 'S2-Probe-α', a||'—', 'PE', a==='PE'?8:0, 2);
-  tracker.log('probe', 'S2-Probe-β', b||'—', 'PF', b==='PF'?8:0, 2);
-  tracker.log('probe', 'S2-Probe-γ', g||'—', 'PVC', g==='PVC'?8:0, 2);
-  let c = 0;
-  if(a === 'PE') c++; if(b === 'PF') c++; if(g === 'PVC') c++;
-  const fb = document.getElementById('c21-feedback');
-  if(c === 3) {
-    fb.className = 'code-feedback success';
-    fb.textContent = '✓ Alle 3 Proben korrekt identifiziert! Probe α=PE, β=PF (Phenolharz/Duroplast), γ=PVC.';
-    score += 25; document.getElementById('score').textContent = score;
-    c21done = true;
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = `${c}/3 richtig. Achte auf: Flammenfarbe, Bruchverhalten und Schmelzpunkt. PF hat keinen Schmelzpunkt (Duroplast!).`;
-  }
-  updateS2Code();
-}
-
-let c22done = false;
-function checkC22() {
-  const t = document.getElementById('c22text').value.trim();
-  const fb = document.getElementById('c22-feedback');
-  if(t.length < 40) {
-    fb.className = 'code-feedback error';
-    fb.textContent = 'Bitte schreibe eine vollständige Antwort (mindestens 2 Sätze).';
-    return;
-  }
-  fb.className = 'code-feedback success';
-  fb.textContent = '✓ Antwort gespeichert! Musterlösung: PET ist Thermoplast (Schmelzpunkt 240°C), für Kochtöpfe zu niedrig. Duroplaste oder hitzebeständige Metalle sind besser geeignet.';
-  score += 20; document.getElementById('score').textContent = score;
-  tracker.log('text', 'S2-Erklaerung-PET', 'beantwortet', 'beantwortet', 20, 2);
-  c22done = true;
-  updateS2Code();
-}
-
-function computeS2Code() {
-  let d1, d2, d3, d4;
-  if(niveau === 'A') {
-    d1 = (s2_answers['mc_21a'] === 2) ? 3 : '?';
-    d2 = (s2_answers['mc_21b'] === 0) ? 1 : '?';
-    d3 = (s2_answers['recycle_done']) ? 7 : '?';
-    d4 = 2;
-  } else if(niveau === 'B') {
-    d1 = b21done ? 4 : '?';
-    d2 = (s2_answers['mc_22a'] === 2) ? 9 : '?';
-    d3 = (s2_answers['mc_22b'] === 0) ? 6 : '?';
-    d4 = 1;
-  } else {
-    d1 = c21done ? 8 : '?';
-    d2 = c22done ? 5 : '?';
-    d3 = 2;
-    d4 = 3;
-  }
-  return [d1, d2, d3, d4];
-}
-
-function updateS2Code() {
-  const digits = computeS2Code();
-  const allFilled = digits.every(d => d !== '?');
-  const area = document.getElementById('s2-code-area');
-  if(!area) return;
-  area.innerHTML = `
-    <div class="code-section">
-      <div class="code-header">▶ STAGE-2-CODE // FREISCHALTUNG</div>
-      <div class="code-display">
-        ${digits.map(d => `<div class="code-digit ${d!=='?'?'filled':''}">${d==='?'?'_':d}</div>`).join('')}
+  if(niveau==='A') {
+    html += `
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">3.1</div><div class="task-title">Monomer → Polymer</div><div class="task-hint">S. 347 M1</div></div>
+      <div class="task-body">Schau dir S. 347 an. Wähle die zutreffenden Aussagen:</div>
+      <div class="options-list" id="s3-31-list">
+        <div class="option-item" onclick="toggleS3MC31(this,'a')"><div class="option-radio"></div>Monomere sind kleine Grundbausteine; Polymere sind lange Ketten aus Tausenden Monomeren.</div>
+        <div class="option-item" onclick="toggleS3MC31(this,'b')"><div class="option-radio"></div>Bei der Polymerisation werden Monomere durch chemische Reaktionen zu Polymeren verknüpft.</div>
+        <div class="option-item" onclick="toggleS3MC31(this,'c')"><div class="option-radio"></div>Monomere entstehen aus Polymeren, indem lange Ketten aufgespalten werden.</div>
       </div>
-      <div class="code-explanation">Löse alle Aufgaben, um den 4-stelligen Code zu erhalten.</div>
-      <button class="check-btn" onclick="checkS2Code()" ${!allFilled?'disabled':''}>CODE PRÜFEN → STAGE 3</button>
-      <div id="s2-code-feedback" class="code-feedback"></div>
+    </div>
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">3.2</div><div class="task-title">Kunststoff & Umwelt</div><div class="task-hint">S. 348</div></div>
+      <div class="task-body">Warum sind Kunststoffe ein Umweltproblem? Wähle alle richtigen Aussagen:</div>
+      <div class="options-list">
+        <div class="option-item" onclick="toggleS3Check(this,'e1')"><div class="option-radio"></div>Kunststoffe sind schwer biologisch abbaubar.</div>
+        <div class="option-item" onclick="toggleS3Check(this,'e2')"><div class="option-radio"></div>Viele Kunststoffe werden für Einwegprodukte genutzt.</div>
+        <div class="option-item" onclick="toggleS3Check(this,'e3')"><div class="option-radio"></div>Kunststoffe werden hauptsächlich aus nachwachsenden Rohstoffen gewonnen.</div>
+        <div class="option-item" onclick="toggleS3Check(this,'e4')"><div class="option-radio"></div>Der größte Teil der Kunststoffe wird aus Erdöl hergestellt.</div>
+      </div>
+    </div>`;
+
+  } else if(niveau==='B') {
+    html += `
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">3.1</div><div class="task-title">Biobasierte Kunststoffe sortieren</div><div class="task-hint">S. 348 M3</div></div>
+      <div class="task-body">Ordne die Kunststoffe in die vier Kategorien (Tabelle M3, S. 348):</div>
+      <div class="sort-area">
+        <div class="sort-items" id="sort-pool2" style="margin-bottom:10px;">
+          <div class="sort-chip" draggable="true" data-chip="PLA" ondragstart="chipDrag2(event,'PLA')" style="background:var(--green);">PLA</div>
+          <div class="sort-chip" draggable="true" data-chip="PET2" ondragstart="chipDrag2(event,'PET2')" style="background:var(--rust);">PET (Erdöl)</div>
+          <div class="sort-chip" draggable="true" data-chip="PBAT" ondragstart="chipDrag2(event,'PBAT')" style="background:var(--amber);color:#000">PBAT</div>
+          <div class="sort-chip" draggable="true" data-chip="PS2" ondragstart="chipDrag2(event,'PS2')" style="background:#666;">PS (konv.)</div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <div class="bin" id="bin2-a" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop2(event,'a')"><div class="bin-label" style="font-size:0.6rem;">nachwachsend + bio abbaubar</div></div>
+          <div class="bin" id="bin2-b" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop2(event,'b')"><div class="bin-label" style="font-size:0.6rem;">nachwachsend + NICHT abbaubar</div></div>
+          <div class="bin" id="bin2-c" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop2(event,'c')"><div class="bin-label" style="font-size:0.6rem;">NICHT nachwachsend + abbaubar</div></div>
+          <div class="bin" id="bin2-d" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop2(event,'d')"><div class="bin-label" style="font-size:0.6rem;">NICHT nachwachsend + NICHT abbaubar</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">3.2</div><div class="task-title">Stellungnahme: Biokunststoffe</div><div class="task-hint">S. 348</div></div>
+      <div class="task-body">Jan: „Biokunststoffe sind biologisch abbaubar." – Stimmt das?</div>
+      <div class="options-list" id="opts-32b">
+        <div class="option-item" onclick="selectS3MC('32b',0,0,'opts-32b')"><div class="option-radio"></div>Stimmt nicht – nicht alle biobasierten Kunststoffe sind biologisch abbaubar (z. B. ist PBAT aus nachwachsenden Rohstoffen, aber nicht biologisch abbaubar).</div>
+        <div class="option-item" onclick="selectS3MC('32b',1,0,'opts-32b')"><div class="option-radio"></div>Stimmt vollständig – alle Kunststoffe aus nachwachsenden Rohstoffen sind automatisch biologisch abbaubar.</div>
+        <div class="option-item" onclick="selectS3MC('32b',2,0,'opts-32b')"><div class="option-radio"></div>Stimmt teilweise – alle biobasierten Kunststoffe auf Stärkebasis sind biologisch abbaubar, andere nicht.</div>
+      </div>
+    </div>`;
+
+  } else {
+    // NIVEAU C
+    html += `
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">3.1</div><div class="task-title">Strukturmerkmale zuordnen</div><div class="task-hint">S. 350–352</div></div>
+      <div class="task-body">Ziehe die Kunststoffgruppe auf das passende Strukturmerkmal.</div>
+      ${buildDragMatchC3()}
+    </div>
+    <div class="task-card">
+      <div class="task-header"><div class="task-num">3.2</div><div class="task-title">Polymilchsäure (PLA) – Chance für die Erde?</div><div class="task-hint">S. 348</div></div>
+      <div class="task-body">Warum wäre PLA eine Verbesserung für WALL-Es Erde? Wähle die treffendste Erklärung:</div>
+      <div class="options-list" id="c32-opts">
+        <div class="option-item" onclick="selectC32(0,0)"><div class="option-radio"></div>PLA wird aus nachwachsenden Rohstoffen wie Stärke gewonnen; Bakterien können es vollständig zu CO₂ und Wasser abbauen, wodurch kein dauerhafter Plastikmüll entsteht.</div>
+        <div class="option-item" onclick="selectC32(1,0)"><div class="option-radio"></div>PLA ist ein biobasierter Kunststoff, der aus Erdöl gewonnen wird, aber durch spezielle chemische Verfahren vollständig recycelt werden kann, ohne biologischen Abbau zu erfordern.</div>
+        <div class="option-item" onclick="selectC32(2,0)"><div class="option-radio"></div>PLA wird aus Stärke hergestellt und ist biologisch abbaubar; allerdings ist dieser Abbau nur unter industriellen Kompostierbedingungen möglich, nicht in der freien Natur oder im Hausmüll.</div>
+      </div>
+    </div>`;
+  }
+
+  html += `<div id="s3-code-area"></div>`;
+  document.getElementById('main-content').innerHTML = html;
+  renderCheckSection('s3-code-area','s3','FINALE MISSION ABSCHLIESSEN','proceedS3');
+}
+
+// =====================================================================
+// UNLOCK SCREENS
+// =====================================================================
+function showUnlock1() {
+  document.getElementById('main-content').innerHTML = `
+    <div class="unlock-screen visible">
+      <div class="unlock-icon">📦</div>
+      <div class="unlock-title">STAGE 1 ABGESCHLOSSEN!</div>
+      <div class="unlock-text">WALL-E sortiert! <em>"Wheee!"</em><br><br>
+        Code <strong style="color:var(--green);font-family:'Share Tech Mono',monospace;">${CODES.s1.join('-')}</strong> gesichert.
+      </div>
+      <button class="next-btn" onclick="renderStage2()">▶ WEITER</button>
     </div>`;
 }
-
-function checkS2Code() {
-  const digits = computeS2Code();
-  const ok = digits.every(d => d !== '?');
-  if(ok) {
-    stage2Code = digits.join('');
-    const fb = document.getElementById('s2-code-feedback');
-    fb.className = 'code-feedback success';
-    fb.textContent = `✓ CODE AKZEPTIERT! ${stage2Code} // Eigenschaften-Analyse abgeschlossen!`;
-    setTimeout(() => showUnlock2(), 1500);
-  }
-}
-
 function showUnlock2() {
   document.getElementById('main-content').innerHTML = `
     <div class="unlock-screen visible">
       <div class="unlock-icon">🔬</div>
       <div class="unlock-title">STAGE 2 ABGESCHLOSSEN!</div>
-      <div class="unlock-text">
-        WALL-E kennt jetzt alle Eigenschaften!<br>
-        <em>"Diiii-rective!"</em> – er hat seinen Auftrag fast erfüllt.<br><br>
-        Code <strong style="color:var(--green);font-family:'Share Tech Mono',monospace;">${stage2Code}</strong> gesichert.<br>
-        Letzte Stage: <strong>RECYCLING & UMWELT</strong>
+      <div class="unlock-text">WALL-E analysiert! <em>"Diiii-rective!"</em><br><br>
+        Code <strong style="color:var(--green);font-family:'Share Tech Mono',monospace;">${CODES.s2.join('-')}</strong> gesichert.
       </div>
       <button class="next-btn" onclick="renderStage3()">▶ FINALE STAGE</button>
     </div>`;
 }
 
 // =====================================================================
-// ███████████  STAGE 3: RECYCLING & STRUKTUR – Abschluss  ████████████
+// FINAL + PDF
 // =====================================================================
-let s3_answers = {};
-let s3_structDone = false;
-let s3_umweltDone = false;
-
-function renderStage3() {
-  updateProgress(3, 'Recycling');
-  s3_answers = {};
-  s3_structDone = false;
-  s3_umweltDone = false;
-
-  let html = `
-  <div class="story-box">
-    <div class="story-tag">▶ FINALE MISSION // STUFE 3</div>
-    <div class="walle-face">🌍</div>
-    <p class="story-text">
-      WALL-E steht vor der Recyclingstation. Die Erde ist fast sauber!
-      Aber jetzt kommt die größte Frage: <strong>Warum ist Plastik ein Umweltproblem?</strong>
-      Was kann man tun? WALL-E braucht dein Expertenwissen – für die Zukunft der Erde!
-    </p>
-  </div>`;
-
-  // ──── AUFGABE 3.1: Struktur ────────────────────────────────────────
-  if(niveau === 'A') {
-    html += `
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">3.1</div>
-        <div class="task-title">Monomer → Polymer</div>
-        <div class="task-hint">S. 347 M1</div>
-      </div>
-      <div class="task-body">
-        Schau dir das Bild auf S. 347 an (Polymerisation). Beantworte:
-      </div>
-      <div class="info-box"><strong>Wähle die zwei richtigen Aussagen zu Monomeren, Polymeren und Polymerisation:</strong><br><span style="font-size:0.8rem;color:#888;">2 Aussagen sind richtig, 1 ist falsch.</span></div>
-      <div class="options-list" id="s3-31-list">
-        <div class="option-item" onclick="toggleS3MC31(this,'a')"><div class="option-radio"></div>Monomere sind kleine Grundbausteine; Polymere sind lange Ketten aus Tausenden Monomeren.</div>
-        <div class="option-item" onclick="toggleS3MC31(this,'b')"><div class="option-radio"></div>Bei der Polymerisation werden Monomere durch chemische Reaktionen zu Polymeren verknüpft.</div>
-        <div class="option-item" onclick="toggleS3MC31(this,'c')"><div class="option-radio"></div>Monomere entstehen aus Polymeren, indem lange Ketten aufgespalten werden.</div>
-      </div>
-      <button class="check-btn" onclick="checkS3MC31()" style="margin-top:10px;">AUSWAHL PRÜFEN</button>
-      <div id="s3-31-fb" class="code-feedback"></div>
-    </div>
-
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">3.2</div>
-        <div class="task-title">Kunststoff & Umwelt</div>
-        <div class="task-hint">S. 348</div>
-      </div>
-      <div class="task-body">
-        Warum sind Kunststoffe ein Umweltproblem? Wähle alle richtigen Aussagen:
-      </div>
-      <div id="env-checks">
-        <div class="option-item" onclick="toggleS3Check(this,'e1')"><div class="option-radio"></div>Kunststoffe sind schwer biologisch abbaubar.</div>
-        <div class="option-item" onclick="toggleS3Check(this,'e2')"><div class="option-radio"></div>Viele Kunststoffe werden für Einwegprodukte genutzt.</div>
-        <div class="option-item" onclick="toggleS3Check(this,'e3')"><div class="option-radio"></div>Kunststoffe werden aus nachwachsenden Rohstoffen gewonnen.</div>
-        <div class="option-item" onclick="toggleS3Check(this,'e4')"><div class="option-radio"></div>Der größte Teil der Kunststoffe wird aus Erdöl hergestellt.</div>
-      </div>
-      <button class="check-btn" onclick="checkA32()" style="margin-top:10px;">PRÜFEN</button>
-      <div id="a32-fb" class="code-feedback"></div>
-    </div>`;
-  } else if(niveau === 'B') {
-    html += `
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">3.1</div>
-        <div class="task-title">Biobasierte Kunststoffe – Tabellen-Analyse</div>
-        <div class="task-hint">S. 348 M3</div>
-      </div>
-      <div class="task-body">
-        Schau dir die Tabelle M3 auf S. 348 an (Kunststoffe und biobasierte Kunststoffe).
-        Ordne diese Kunststoffe in die vier Kategorien ein:
-      </div>
-      <div class="sort-area">
-        <div class="sort-items" id="sort-pool2">
-          <div class="sort-chip" draggable="true" data-chip="PLA" ondragstart="chipDrag2(event,'PLA')" style="background:var(--green);">PLA (Polymilchsäure)</div>
-          <div class="sort-chip" draggable="true" data-chip="PET2" ondragstart="chipDrag2(event,'PET2')" style="background:var(--rust);">PET (aus Erdöl)</div>
-          <div class="sort-chip" draggable="true" data-chip="PBAT" ondragstart="chipDrag2(event,'PBAT')" style="background:var(--amber);color:#000">PBAT</div>
-          <div class="sort-chip" draggable="true" data-chip="PS2" ondragstart="chipDrag2(event,'PS2')" style="background:#666;">PS (konventionell)</div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;">
-          <div class="bin" id="bin2-a" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop2(event,'a')">
-            <div class="bin-label" style="font-size:0.6rem;">nachwachsend + bio abbaubar</div>
-          </div>
-          <div class="bin" id="bin2-b" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop2(event,'b')">
-            <div class="bin-label" style="font-size:0.6rem;">nachwachsend + NICHT bio abbaubar</div>
-          </div>
-          <div class="bin" id="bin2-c" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop2(event,'c')">
-            <div class="bin-label" style="font-size:0.6rem;">NICHT nachwachsend + bio abbaubar</div>
-          </div>
-          <div class="bin" id="bin2-d" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="chipDrop2(event,'d')">
-            <div class="bin-label" style="font-size:0.6rem;">NICHT nachwachsend + NICHT bio abbaubar</div>
-          </div>
-        </div>
-      </div>
-      <button class="check-btn" onclick="checkB31()" style="margin-top:10px;">SORTIERUNG PRÜFEN</button>
-      <div id="b31-feedback" class="code-feedback"></div>
-    </div>
-
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">3.2</div>
-        <div class="task-title">Stellungnahme: Biokunststoffe</div>
-        <div class="task-hint">S. 348</div>
-      </div>
-      <div class="task-body">
-        Jan behauptet: „Biokunststoffe sind biologisch abbaubar." – Stimmt das? 
-        Beziehe Stellung anhand der Tabelle auf S. 348.
-      </div>
-      <div class="options-list" id="opts-32b">
-        <div class="option-item" onclick="selectS3MC('32b',0,0,'opts-32b','s3-32b-fb')"><div class="option-radio"></div>Stimmt nicht – nicht alle biobasierten Kunststoffe sind biologisch abbaubar (z.B. PBAT aus nachwachsenden Rohstoffen, aber nicht abbaubar).</div>
-        <div class="option-item" onclick="selectS3MC('32b',1,0,'opts-32b','s3-32b-fb')"><div class="option-radio"></div>Stimmt vollständig – alle Biokunststoffe sind abbaubar.</div>
-        <div class="option-item" onclick="selectS3MC('32b',2,0,'opts-32b','s3-32b-fb')"><div class="option-radio"></div>Stimmt teilweise – alle biobasierten Kunststoffe aus Stärke sind abbaubar.</div>
-      </div>
-      <div id="s3-32b-fb" class="code-feedback"></div>
-    </div>`;
-  } else {
-    // C
-    html += `
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">3.1</div>
-        <div class="task-title">Strukturvergleich: Thermo / Duro / Elasto</div>
-        <div class="task-hint">S. 350–352</div>
-      </div>
-      <div class="task-body">
-        Verbinde die Begriffe mit ihrer korrekten Beschreibung (Zuordnungsaufgabe):
-      </div>
-      ${buildMatchingB()}
-      <button class="check-btn" onclick="checkC31()" style="margin-top:10px;">ZUORDNUNG PRÜFEN</button>
-      <div id="c31-feedback" class="code-feedback"></div>
-    </div>
-
-    <div class="task-card">
-      <div class="task-header">
-        <div class="task-num">3.2</div>
-        <div class="task-title">Polymilchsäure – Chance für WALL-Es Erde?</div>
-        <div class="task-hint">S. 348</div>
-      </div>
-      <div class="task-body">
-        Erkläre, warum Polymilchsäure (PLA) für WALL-Es Erde eine Verbesserung wäre.
-        Nutze Begriffe: <em>nachwachsende Rohstoffe, biologisch abbaubar, Bakterien, Stärke</em>.
-      </div>
-      <textarea id="c32text" style="width:100%;background:#0f0c06;border:1px solid var(--dim);border-radius:6px;color:#c8b880;padding:10px;font-family:'Nunito',sans-serif;font-size:0.88rem;min-height:100px;margin:10px 0;" placeholder="PLA wird aus... hergestellt. Es ist... abbaubar, weil..."></textarea>
-      <button class="check-btn" onclick="checkC32()">ANTWORT EINREICHEN</button>
-      <div id="c32-feedback" class="code-feedback"></div>
-    </div>`;
-  }
-
-  html += `<div id="s3-code-area"></div>`;
-  document.getElementById('main-content').innerHTML = html;
-  updateS3Code();
-}
-
-// S3 helpers
-// Aufgabe 3.1 Mehrfachauswahl (2 richtig: a+b, 1 falsch: c)
-let s3_mc31 = {};
-function toggleS3MC31(el, key) {
-  el.classList.toggle('selected');
-  s3_mc31[key] = el.classList.contains('selected');
-  // max 2 selections
-  const selected = Object.values(s3_mc31).filter(Boolean).length;
-  if(selected > 2) {
-    el.classList.remove('selected');
-    s3_mc31[key] = false;
-  }
-}
-
-function checkS3MC31() {
-  const correct = {a: true, b: true, c: false};
-  const items = document.querySelectorAll('#s3-31-list .option-item');
-  const keys = ['a','b','c'];
-  let allCorrect = true;
-  keys.forEach((k, i) => {
-    const chosen = !!s3_mc31[k];
-    items[i].classList.remove('correct','wrong','selected');
-    if(chosen === correct[k]) {
-      items[i].classList.add('correct');
-    } else {
-      items[i].classList.add('wrong');
-      allCorrect = false;
-    }
-  });
-  const fb = document.getElementById('s3-31-fb');
-  if(allCorrect) {
-    fb.className = 'code-feedback success';
-    fb.textContent = '✓ Richtig! Monomere → Polymerisation → Polymere. Aussage c ist falsch: Polymere entstehen AUS Monomeren, nicht umgekehrt.';
-    score += 10; document.getElementById('score').textContent = score;
-    s3_answers['mc31_done'] = true;
-    tracker.log('mc', 'S3-31-multi', JSON.stringify(s3_mc31), '{"a":true,"b":true,"c":false}', 10, 3);
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = '✗ Nicht ganz. Tipp: Richtig sind die Aussagen, bei denen Monomere → Polymere (nicht andersrum). Schau auf S. 347.';
-    tracker.log('mc', 'S3-31-multi', JSON.stringify(s3_mc31), '{"a":true,"b":true,"c":false}', 0, 3);
-  }
-  updateS3Code();
-}
-
-let s3_checks = {};
-function toggleS3Check(el, id) {
-  el.classList.toggle('selected');
-  s3_checks[id] = el.classList.contains('selected');
-  updateS3Code();
-}
-
-function checkA32() {
-  // Correct: e1, e2, e4 = true; e3 = false
-  const correct = {e1:true, e2:true, e3:false, e4:true};
-  let c = 0;
-  for(let k in correct) {
-    const isOk = !!s3_checks[k] === correct[k];
-    if(isOk) c++;
-    tracker.log('check', 'S3-Umwelt-'+k, String(!!s3_checks[k]), String(correct[k]), isOk?4:0, 3);
-  }
-  const fb = document.getElementById('a32-fb');
-  if(c === 4) {
-    fb.className = 'code-feedback success';
-    fb.textContent = '✓ Richtig! Kunststoffe sind schwer abbaubar, werden aus Erdöl gemacht und oft für Einwegprodukte genutzt.';
-    score += 15; document.getElementById('score').textContent = score;
-    s3_umweltDone = true;
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = `${c}/4 richtig. Achtung: "Nachwachsende Rohstoffe" ist FALSCH – Erdöl ist kein nachwachsender Rohstoff!`;
-  }
-  updateS3Code();
-}
-
-function selectS3MC(id, idx, correct, listId, fbId) {
-  const container = listId ? document.getElementById(listId) : event.target.closest('.options-list');
-  if(!container) return;
-  const items = container.querySelectorAll('.option-item');
-  items.forEach(it => it.classList.remove('selected','correct','wrong'));
-  items[idx].classList.add('selected');
-  s3_answers['mc_'+id] = idx;
-  const isCorrect = idx === correct;
-  tracker.log('mc', 'S3-MC-'+id, idx, correct, isCorrect ? 10 : 0, 3);
-  const fb = fbId ? document.getElementById(fbId) : null;
-  if(isCorrect) {
-    items[idx].classList.add('correct');
-    score += 10; document.getElementById('score').textContent = score;
-    if(fb) { fb.className='code-feedback success'; fb.textContent='✓ Richtig!'; }
-  } else {
-    items[idx].classList.add('wrong');
-    if(items[correct]) items[correct].classList.add('correct');
-    if(fb) { fb.className='code-feedback error'; fb.textContent='✗ Nicht ganz – die richtige Antwort ist grün markiert.'; }
-  }
-  updateS3Code();
-}
-
-// B31: second sort
-let draggedChip2 = null;
-let s3_sort2 = {};
-function chipDrag2(e, id) { draggedChip2 = id; }
-function chipDrop2(e, binName) {
-  e.preventDefault();
-  const bin = document.getElementById('bin2-' + binName);
-  bin.classList.remove('drag-over');
-  if(!draggedChip2) return;
-  const existing = document.querySelector(`[data-chip="${draggedChip2}"]`);
-  if(existing) { for(let k in s3_sort2) { if(s3_sort2[k]===draggedChip2) delete s3_sort2[k]; } existing.remove(); }
-  s3_sort2[draggedChip2] = binName;
-  const chip = document.createElement('div');
-  chip.className = 'sort-chip';
-  chip.style.fontSize = '0.75rem';
-  chip.draggable = true;
-  chip.dataset.chip = draggedChip2;
-  chip.textContent = draggedChip2;
-  chip.addEventListener('click', () => { delete s3_sort2[draggedChip2]; chip.remove(); });
-  bin.appendChild(chip);
-  draggedChip2 = null;
-}
-
-function checkB31() {
-  const correct = {PLA:'a', PET2:'d', PBAT:'c', PS2:'d'};
-  let c = 0;
-  for(let k in correct) {
-    const isOk = s3_sort2[k] === correct[k];
-    if(isOk) c++;
-    tracker.log('sort', 'S3-Biokunststoff-'+k, s3_sort2[k]||'—', correct[k], isOk?5:0, 3);
-  }
-  const fb = document.getElementById('b31-feedback');
-  if(c === 4) {
-    fb.className = 'code-feedback success';
-    fb.textContent = '✓ Perfekt! PLA = nachwachsend+abbaubar; PET aus Erdöl+nicht abbaubar; PBAT = nicht nachwachsend+abbaubar; PS = nicht nachwachsend+nicht abbaubar.';
-    score += 20; document.getElementById('score').textContent = score;
-    s3_structDone = true;
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = `${c}/4 richtig. Tipp: Schau in Tabelle M3 S. 348 – "nachwachsend" und "abbaubar" sind zwei unabhängige Eigenschaften!`;
-  }
-  updateS3Code();
-}
-
-function buildMatchingB() {
-  return `
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0;">
-    <div>
-      <div class="match-col-header">KUNSTSTOFFGRUPPE</div>
-      <div class="match-item" id="mb-tp" onclick="matchClickB('tp','left')">Thermoplast</div>
-      <div class="match-item" id="mb-dp" onclick="matchClickB('dp','left')">Duroplast</div>
-      <div class="match-item" id="mb-el" onclick="matchClickB('el','left')">Elastomer</div>
-    </div>
-    <div>
-      <div class="match-col-header">STRUKTURMERKMAL</div>
-      <div class="match-item" id="mb-tp_r" onclick="matchClickB('tp_r','right')">Lange, unverzweigte Ketten, Van-der-Waals-Kräfte – beim Erwärmen verformbar</div>
-      <div class="match-item" id="mb-dp_r" onclick="matchClickB('dp_r','right')">Engmaschiges 3D-Netz aus Elektronenpaarbindungen – hitzebeständig</div>
-      <div class="match-item" id="mb-el_r" onclick="matchClickB('el_r','right')">Wenige Verknüpfungspunkte, dehnbar, kehrt in Ausgangsform zurück</div>
-    </div>
-  </div>`;
-}
-
-const matchBPairs = {tp:'tp_r', dp:'dp_r', el:'el_r'};
-let matchBFirst = null;
-let matchBDone = {};
-
-function matchClickB(id, side) {
-  if(matchBDone[id]) return;
-  if(!matchBFirst) {
-    matchBFirst = {id, side};
-    document.getElementById('mb-'+id).classList.add('selected');
-  } else {
-    const a = matchBFirst;
-    const b = {id, side};
-    if(a.side === b.side) {
-      document.getElementById('mb-'+a.id).classList.remove('selected');
-      matchBFirst = {id, side};
-      document.getElementById('mb-'+id).classList.add('selected');
-      return;
-    }
-    const leftId = a.side === 'left' ? a.id : b.id;
-    const rightId = a.side === 'right' ? a.id : b.id;
-    const correct = matchBPairs[leftId] === rightId;
-    const aEl = document.getElementById('mb-'+a.id);
-    const bEl = document.getElementById('mb-'+b.id);
-    if(correct) {
-      aEl.classList.add('matched-correct'); aEl.classList.remove('selected');
-      bEl.classList.add('matched-correct');
-      matchBDone[a.id] = true; matchBDone[b.id] = true;
-      score += 10; document.getElementById('score').textContent = score;
-    } else {
-      aEl.classList.add('matched-wrong'); bEl.classList.add('matched-wrong');
-      setTimeout(() => { aEl.classList.remove('matched-wrong','selected'); bEl.classList.remove('matched-wrong'); }, 700);
-    }
-    matchBFirst = null;
-    updateS3Code();
-  }
-}
-
-function checkC31() {
-  const done = Object.keys(matchBDone).filter(k => !k.includes('_r')).length;
-  const fb = document.getElementById('c31-feedback');
-  tracker.log('match', 'S3-Strukturzuordnung', String(done)+'/3', '3/3', done===3?15:0, 3);
-  if(done === 3) {
-    fb.className = 'code-feedback success';
-    fb.textContent = '✓ Alle Zuordnungen korrekt! Strukturwissen vollständig.';
-    score += 15; document.getElementById('score').textContent = score;
-    s3_structDone = true;
-  } else {
-    fb.className = 'code-feedback error';
-    fb.textContent = `${done}/3 korrekt zugeordnet.`;
-  }
-  updateS3Code();
-}
-
-let c32done = false;
-function checkC32() {
-  const t = document.getElementById('c32text').value.trim();
-  const fb = document.getElementById('c32-feedback');
-  if(t.length < 50) { fb.className='code-feedback error'; fb.textContent='Bitte vollständiger antworten.'; return; }
-  fb.className = 'code-feedback success';
-  fb.textContent = '✓ Musterlösung: PLA wird aus nachwachsenden Rohstoffen (Stärke) gewonnen. Bakterien können PLA zu CO₂ und Wasser abbauen. Das reduziert Plastikmüll, weil keine dauerhaften Abfälle entstehen.';
-  score += 25; document.getElementById('score').textContent = score;
-  tracker.log('text', 'S3-PLA-Erklaerung', 'beantwortet', 'beantwortet', 25, 3);
-  c32done = true;
-  s3_umweltDone = true;
-  updateS3Code();
-}
-
-function computeS3Code() {
-  let d1, d2, d3, d4;
-  if(niveau === 'A') {
-    d1 = s3_answers['mc31_done'] ? 6 : '?';
-    d2 = s3_umweltDone ? 4 : '?';
-    d3 = 9;
-    d4 = 1;
-  } else if(niveau === 'B') {
-    d1 = s3_structDone ? 7 : '?';
-    d2 = (s3_answers['mc_32b'] === 0) ? 3 : '?';
-    d3 = 5;
-    d4 = 2;
-  } else {
-    d1 = s3_structDone ? 9 : '?';
-    d2 = c32done ? 8 : '?';
-    d3 = 6;
-    d4 = 4;
-  }
-  return [d1, d2, d3, d4];
-}
-
-function updateS3Code() {
-  const digits = computeS3Code();
-  const allFilled = digits.every(d => d !== '?');
-  const area = document.getElementById('s3-code-area');
-  if(!area) return;
-  area.innerHTML = `
-    <div class="code-section">
-      <div class="code-header">▶ FINAL-CODE // MISSION ABSCHLIESSEN</div>
-      <div class="code-display">
-        ${digits.map(d => `<div class="code-digit ${d!=='?'?'filled':''}">${d==='?'?'_':d}</div>`).join('')}
-      </div>
-      <div class="code-explanation">Löse alle 2 Aufgaben, um den finalen Code zu erhalten.</div>
-      <button class="check-btn" onclick="checkS3Code()" ${!allFilled?'disabled':''}>FINALE MISSION ABSCHLIESSEN ✓</button>
-      <div id="s3-code-feedback" class="code-feedback"></div>
-    </div>`;
-}
-
-function checkS3Code() {
-  const digits = computeS3Code();
-  const ok = digits.every(d => d !== '?');
-  if(ok) {
-    stage3Code = digits.join('');
-    const fb = document.getElementById('s3-code-feedback');
-    fb.className = 'code-feedback success';
-    fb.textContent = `✓ FINAL-CODE AKZEPTIERT! ${stage3Code} // Mission erfolgreich!`;
-    setTimeout(() => showFinal(), 1500);
-  }
-}
-
 function showFinal() {
-  const allCodes = `${stage1Code} – ${stage2Code} – ${stage3Code}`;
+  const allCodes = `${CODES.s1.join('-')} – ${CODES.s2.join('-')} – ${CODES.s3.join('-')}`;
   const sum = tracker.summary();
-  const totalEvents = tracker.events.length;
-  const totalCorrect = tracker.events.filter(e => e.isCorrect).length;
-  const pct = totalEvents > 0 ? Math.round(totalCorrect / totalEvents * 100) : 0;
-  const stars = pct >= 90 ? 5 : pct >= 75 ? 4 : pct >= 60 ? 3 : pct >= 40 ? 2 : 1;
-  const starStr = '★'.repeat(stars) + '☆'.repeat(5-stars);
-  const stageNames = ['Sammeln & Sortieren', 'Eigenschaften analysieren', 'Recycling & Struktur'];
+  const sc = tracker.computeScore();
+  const pct = Math.round(sc.earned / sc.max * 100);
+  const stars = pct>=90?5:pct>=75?4:pct>=60?3:pct>=40?2:1;
+  const starStr = '★'.repeat(stars)+'☆'.repeat(5-stars);
+  const stageNames = ['Sammeln & Sortieren','Eigenschaften analysieren','Recycling & Struktur'];
+  const feedbackMsg = pct>=90?'WALL-E ist begeistert! 🎉 Hervorragende Leistung!'
+    :pct>=70?'Gut gemacht! Ein paar Themen nochmal nachschlagen.'
+    :pct>=50?'Grundlagen vorhanden – lies S. 350–353 nochmal durch!'
+    :'Schau dir die Tabellen im Buch nochmal an.';
+
+  const playCount = Store.getPlayCount(playerName);
+  const sessionSummary = { pct, score:sc.earned, maxScore:sc.max, niveau, allCodes, feedbackMsg };
+  Store.finishSession(playerName, sessionSummary);
+
+  const history = Store.getHistory(playerName);
+  const bestPct = history.length > 0 ? Math.max(...history.map(s => s.summary?.pct || 0)) : pct;
 
   const stageRows = sum.byStage.map(s => {
-    const p = s.total > 0 ? Math.round(s.correct / s.total * 100) : 0;
-    const color = p >= 80 ? 'var(--green)' : p >= 50 ? 'var(--amber)' : 'var(--red)';
+    const p = s.total>0?Math.round(s.correct/s.total*100):0;
+    const col = p>=80?'var(--green)':p>=50?'var(--amber)':'var(--red)';
     return `<tr>
       <td style="padding:8px 12px;color:#a09060;">Stage ${s.s} – ${stageNames[s.s-1]}</td>
       <td style="padding:8px 12px;text-align:center;font-weight:700;">${s.correct}/${s.total}</td>
-      <td style="padding:8px 12px;text-align:center;color:${color};font-weight:700;">${s.total>0?p+'%':'—'}</td>
-      <td style="padding:8px 12px;width:120px;">
-        <div style="background:#1a140a;border-radius:4px;height:8px;overflow:hidden;">
-          <div style="width:${p}%;height:100%;background:${color};border-radius:4px;"></div>
-        </div>
-      </td>
-    </tr>`;
+      <td style="padding:8px 12px;text-align:center;color:${col};font-weight:700;">${s.total>0?p+'%':'—'}</td>
+      <td style="padding:8px 12px;width:120px;"><div style="background:#1a140a;border-radius:4px;height:8px;overflow:hidden;">
+        <div style="width:${p}%;height:100%;background:${col};border-radius:4px;"></div></div></td></tr>`;
   }).join('');
 
   const seen = new Set();
-  const wrongRows = sum.wrongItems.filter(e => {
-    if(seen.has(e.question)) return false;
-    seen.add(e.question); return true;
-  }).map(e => {
-    const labels = { thermo:'Thermoplaste', duro:'Duroplaste', elasto:'Elastomere', '—':'(nicht beantwortet)' };
-    return `<tr>
-      <td style="padding:6px 10px;font-family:'Share Tech Mono',monospace;font-size:0.78rem;color:#e8d8b0;">${e.question}</td>
-      <td style="padding:6px 10px;font-size:0.82rem;color:var(--red);">${labels[e.given]||e.given}</td>
-      <td style="padding:6px 10px;font-size:0.82rem;color:var(--green);">${labels[e.correct]||e.correct}</td>
-    </tr>`;
-  }).join('');
+  const wrongRows = sum.wrongItems.filter(e=>{if(seen.has(e.question))return false;seen.add(e.question);return true;})
+    .map(e=>{
+      const lbl={thermo:'Thermoplaste',duro:'Duroplaste',elasto:'Elastomere','—':'(nicht beantwortet)','detached':'(nicht zugeordnet)','true':'richtig (✓)','false':'falsch (✗)',"true":'richtig (✓)',"false":'falsch (✗)'};
+      const tv = v => { const t=lbl[v]; if(t) return t; return v.replace(/"true"/g,'"richtig"').replace(/"false"/g,'"falsch"').replace(/:true/g,':richtig').replace(/:false/g,':falsch'); };
+      return `<tr>
+        <td style="padding:6px 10px;font-family:'Share Tech Mono',monospace;font-size:0.78rem;color:#e8d8b0;">${e.question}</td>
+        <td style="padding:6px 10px;font-size:0.82rem;color:var(--red);">${tv(e.given)}</td>
+        <td style="padding:6px 10px;font-size:0.82rem;color:var(--green);">${tv(e.correct)}</td></tr>`;
+    }).join('');
 
-  const feedbackMsg = pct >= 90 ? `WALL-E ist begeistert! 🎉 Du bist ein echter Kunststoff-Experte!`
-    : pct >= 70 ? `Gut gemacht! Ein paar Themen solltest du nochmal im Buch nachschlagen.`
-    : pct >= 50 ? `Du hast die Grundlagen – aber einige Kunststoffe haben dich noch genarrt. Lies S. 350–353 nochmal!`
-    : `WALL-E braucht noch deine Hilfe! Schau dir die Tabellen im Buch nochmal an und versuche es erneut.`;
+  window._finalData = { allCodes, pct, starStr, score:sc.earned, maxScore:sc.max, niveau, feedbackMsg, playerName, playCount, bestPct };
+  for(let i=1;i<=3;i++) document.getElementById('dot'+i).className='stage-dot done';
 
-  // Store for PDF generation
-  window._finalData = { allCodes, pct, stars, starStr, score, totalCorrect, totalEvents, niveau, stageRows, wrongRows, feedbackMsg };
+  const playLabel = playCount === 1 ? '1. Versuch' : `${playCount}. Versuch`;
+  const newBest = pct >= bestPct ? ' 🏅 Neuer Rekord!' : '';
 
   document.getElementById('main-content').innerHTML = `
     <div class="final-screen visible">
       <div class="final-icon">🌍✨</div>
       <div class="final-title">MISSION ACCOMPLISHED!</div>
-      <div class="final-text"><em>"Eeeeva! Eeeeva!"</em> – WALL-E freut sich!<br>${feedbackMsg}</div>
-
-      <div class="certificate" style="margin-bottom:30px;">
+      <div class="final-text"><em>"Eeeeva!"</em> – WALL-E freut sich!<br>${feedbackMsg}</div>
+      <div class="certificate" style="margin-bottom:24px;">
         <div class="cert-title">⬡ WALL-E RECYCLING-ZERTIFIKAT // NIVEAU ${niveau}</div>
-        <div style="font-size:2rem;margin:8px 0;color:var(--amber);">${starStr}</div>
-        <div class="cert-name">${pct}% Gesamtergebnis · ${score} Punkte</div>
-        <div class="cert-text">
-          Stage-Codes: <span style="font-family:'Share Tech Mono',monospace;color:var(--green);">${allCodes}</span><br>
-          Richtig: ${totalCorrect} / ${totalEvents} Aufgaben
+        <div style="font-size:1.8rem;margin:8px 0;color:var(--amber);">${starStr}</div>
+        <div class="cert-name">${playerName}</div>
+        <div class="cert-text">${pct}% · ${sc.earned}/${sc.max} Punkte${newBest}<br>
+          <span style="color:#888;font-size:0.8rem;">${playLabel} · Bestes Ergebnis: ${bestPct}%</span><br>
+          Codes: <span style="font-family:'Share Tech Mono',monospace;color:var(--green);">${allCodes}</span>
         </div>
       </div>
-
       <div style="background:var(--panel);border:1px solid var(--dim);border-radius:10px;margin-bottom:20px;overflow:hidden;">
-        <div style="padding:14px 16px;border-bottom:1px solid var(--dim);font-family:'Orbitron',monospace;font-size:0.7rem;color:var(--sky);letter-spacing:3px;">▶ AUSWERTUNG NACH STAGE</div>
+        <div style="padding:12px 16px;border-bottom:1px solid var(--dim);font-family:'Orbitron',monospace;font-size:0.7rem;color:var(--sky);letter-spacing:3px;">▶ AUSWERTUNG NACH STAGE</div>
         <table style="width:100%;border-collapse:collapse;">
           <tr style="background:#1a140a;">
-            <th style="padding:8px 12px;text-align:left;font-family:'Share Tech Mono',monospace;font-size:0.72rem;color:#888;">BEREICH</th>
-            <th style="padding:8px 12px;font-family:'Share Tech Mono',monospace;font-size:0.72rem;color:#888;">RICHTIG</th>
-            <th style="padding:8px 12px;font-family:'Share Tech Mono',monospace;font-size:0.72rem;color:#888;">QUOTE</th>
-            <th style="padding:8px 12px;font-family:'Share Tech Mono',monospace;font-size:0.72rem;color:#888;">FORTSCHRITT</th>
-          </tr>
-          ${stageRows}
+            <th style="padding:8px 12px;text-align:left;font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:#888;">BEREICH</th>
+            <th style="padding:8px 12px;font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:#888;">RICHTIG</th>
+            <th style="padding:8px 12px;font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:#888;">QUOTE</th>
+            <th style="padding:8px 12px;font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:#888;">FORTSCHRITT</th>
+          </tr>${stageRows}
         </table>
       </div>
-
       ${wrongRows ? `
       <div style="background:var(--panel);border:1px solid var(--dim);border-radius:10px;margin-bottom:20px;overflow:hidden;">
-        <div style="padding:14px 16px;border-bottom:1px solid var(--dim);font-family:'Orbitron',monospace;font-size:0.7rem;color:var(--red);letter-spacing:3px;">▶ NACHSCHLAGEN EMPFOHLEN</div>
+        <div style="padding:12px 16px;border-bottom:1px solid var(--dim);font-family:'Orbitron',monospace;font-size:0.7rem;color:var(--red);letter-spacing:3px;">▶ NACHSCHLAGEN EMPFOHLEN</div>
         <table style="width:100%;border-collapse:collapse;">
           <tr style="background:#1a140a;">
             <th style="padding:6px 10px;text-align:left;font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:#888;">AUFGABE</th>
-            <th style="padding:6px 10px;text-align:left;font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:#888;">DEINE ANTWORT</th>
-            <th style="padding:6px 10px;text-align:left;font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:#888;">RICHTIGE ANTWORT</th>
-          </tr>
-          ${wrongRows}
+            <th style="padding:6px 10px;text-align:left;font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:#888;">ANTWORT</th>
+            <th style="padding:6px 10px;text-align:left;font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:#888;">RICHTIG WÄRE</th>
+          </tr>${wrongRows}
         </table>
-        <div style="padding:10px 16px;font-size:0.82rem;color:#888;border-top:1px solid var(--dim);">💡 Schau nochmal auf S. 349–353 in deinem Buch.</div>
+        <div style="padding:10px 16px;font-size:0.82rem;color:#888;border-top:1px solid var(--dim);">💡 S. 347–353 im Buch.</div>
       </div>` : `
       <div style="background:rgba(92,184,92,0.1);border:1px solid var(--green);border-radius:10px;padding:16px;margin-bottom:20px;text-align:center;color:var(--green);font-weight:700;">
-        🏆 Keine Fehler! Perfekte Leistung!
-      </div>`}
-
-      <div style="margin-top:10px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
+        🏆 Keine Fehler – perfekte Leistung!</div>`}
+      <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:10px;">
         <button class="next-btn" onclick="location.reload()" style="background:var(--dim);color:var(--sand);">🔄 NEU STARTEN</button>
-        <button class="next-btn" onclick="showPdfModal()" style="background:transparent;border:2px solid var(--sand);color:var(--sand);">📄 ALS PDF SPEICHERN</button>
-      </div>
-    </div>
-
-    <!-- PDF NAME MODAL -->
-    <div id="pdf-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:1000;align-items:center;justify-content:center;">
-      <div style="background:#1e1810;border:2px solid var(--sand);border-radius:12px;padding:30px;max-width:400px;width:90%;text-align:center;">
-        <div style="font-family:'Orbitron',monospace;font-size:0.8rem;color:var(--sand);letter-spacing:2px;margin-bottom:16px;">📄 PDF ERSTELLEN</div>
-        <p style="font-size:0.9rem;color:#c8b880;margin-bottom:16px;">Gib deinen Namen ein. Er erscheint auf der Auswertung.</p>
-        <input id="pdf-name" type="text" placeholder="Dein Name..." maxlength="40"
-          style="width:100%;background:#0f0c06;border:2px solid var(--dim);border-radius:6px;color:var(--sand);font-family:'Nunito',sans-serif;font-size:1rem;padding:10px 14px;margin-bottom:16px;text-align:center;outline:none;"
-          onkeydown="if(event.key==='Enter') triggerPdfPrint()"
-          oninput="this.style.borderColor='var(--amber)'" />
-        <div style="display:flex;gap:10px;justify-content:center;">
-          <button onclick="document.getElementById('pdf-modal').style.display='none'"
-            style="padding:10px 20px;background:var(--dim);border:none;border-radius:6px;color:#a09060;cursor:pointer;font-family:'Nunito',sans-serif;">Abbrechen</button>
-          <button onclick="triggerPdfPrint()"
-            style="padding:10px 24px;background:var(--amber);border:none;border-radius:6px;color:#1a1206;font-weight:800;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.75rem;letter-spacing:1px;">
-            DRUCKEN / PDF
-          </button>
-        </div>
-        <p style="font-size:0.75rem;color:#666;margin-top:12px;">Im Druckdialog „Als PDF speichern" wählen.</p>
+        <button class="next-btn" onclick="exportPdf()" style="background:transparent;border:2px solid var(--sand);color:var(--sand);">📄 ALS PDF SPEICHERN</button>
       </div>
     </div>`;
-
-  for(let i=1;i<=3;i++) document.getElementById('dot'+i).className = 'stage-dot done';
 }
 
-function showPdfModal() {
-  const modal = document.getElementById('pdf-modal');
-  modal.style.display = 'flex';
-  setTimeout(() => document.getElementById('pdf-name').focus(), 50);
-}
-
-function triggerPdfPrint() {
-  const name = document.getElementById('pdf-name').value.trim() || 'Unbekannt';
-  document.getElementById('pdf-modal').style.display = 'none';
+// =====================================================================
+// PDF EXPORT
+// =====================================================================
+function exportPdf() {
   const d = window._finalData;
-  const dateStr = new Date().toLocaleDateString('de-DE', {day:'2-digit', month:'2-digit', year:'numeric'});
-  const printHtml = `
-<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
-<title>WALL-E Auswertung – ${name}</title>
+  const dateStr = new Date().toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit',year:'numeric'});
+  const printHtml = `<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+<title>WALL-E Auswertung – ${d.playerName}</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Nunito:wght@400;600;700;800&family=Share+Tech+Mono&display=swap');
-  * { box-sizing:border-box; margin:0; padding:0; }
-  body { font-family:'Nunito',sans-serif; background:#fff; color:#1a1206; padding:20px 30px; font-size:11pt; }
-  .header { display:flex; align-items:center; gap:16px; border-bottom:3px solid #c94a2c; padding-bottom:14px; margin-bottom:18px; }
-  .walle { font-size:3rem; }
-  .h-title { font-family:'Orbitron',monospace; font-size:1.3rem; font-weight:900; color:#c94a2c; }
-  .h-sub { font-size:0.85rem; color:#666; font-family:'Share Tech Mono',monospace; letter-spacing:2px; margin-top:3px; }
-  .meta { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:18px; }
-  .meta-box { border:1px solid #ddd; border-radius:6px; padding:10px 14px; }
-  .meta-label { font-size:0.72rem; color:#999; font-family:'Share Tech Mono',monospace; letter-spacing:1px; margin-bottom:3px; }
-  .meta-val { font-size:1.1rem; font-weight:800; color:#1a1206; }
-  .stars { color:#e8a000; font-size:1.4rem; }
-  .section-title { font-family:'Orbitron',monospace; font-size:0.7rem; letter-spacing:3px; color:#555; border-bottom:1px solid #ddd; padding-bottom:6px; margin:16px 0 10px; }
-  table { width:100%; border-collapse:collapse; font-size:10pt; }
-  th { background:#f5f5f5; padding:7px 10px; text-align:left; font-family:'Share Tech Mono',monospace; font-size:0.68rem; color:#666; letter-spacing:1px; }
-  td { padding:7px 10px; border-bottom:1px solid #eee; }
-  .pct-good { color:#3a8a3a; font-weight:700; }
-  .pct-mid  { color:#c07000; font-weight:700; }
-  .pct-bad  { color:#c02020; font-weight:700; }
-  .bar-wrap { background:#eee; border-radius:3px; height:7px; overflow:hidden; width:100px; }
-  .bar-fill { height:100%; border-radius:3px; }
-  .code-box { background:#f5f5f5; border:1px solid #ddd; border-radius:6px; padding:12px 16px; font-family:'Share Tech Mono',monospace; font-size:0.9rem; margin-bottom:16px; }
-  .wrong-given { color:#c02020; }
-  .wrong-correct { color:#2a7a2a; }
-  .no-errors { background:#eafaea; border:1px solid #3a8a3a; border-radius:6px; padding:12px; text-align:center; color:#2a7a2a; font-weight:700; }
-  .footer { margin-top:24px; padding-top:12px; border-top:1px solid #ddd; font-size:0.75rem; color:#999; display:flex; justify-content:space-between; }
-  .feedback-box { background:#fff8e8; border-left:4px solid #e8a000; padding:10px 14px; border-radius:0 6px 6px 0; margin-bottom:16px; font-size:10pt; }
-  @media print {
-    body { padding:15px 20px; }
-    @page { margin:1.5cm; size:A4; }
-  }
+  body{font-family:Arial,sans-serif;background:#fff;color:#1a1206;padding:20px 30px;font-size:11pt;}
+  .header{display:flex;align-items:center;gap:16px;border-bottom:3px solid #c94a2c;padding-bottom:14px;margin-bottom:18px;}
+  .h-title{font-size:1.3rem;font-weight:900;color:#c94a2c;}
+  .h-sub{font-size:0.85rem;color:#666;letter-spacing:2px;margin-top:3px;}
+  .meta{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:18px;}
+  .meta-box{border:1px solid #ddd;border-radius:6px;padding:10px 14px;}
+  .meta-label{font-size:0.72rem;color:#999;letter-spacing:1px;margin-bottom:3px;text-transform:uppercase;}
+  .meta-val{font-size:1.1rem;font-weight:800;}
+  .section-title{font-size:0.7rem;letter-spacing:3px;color:#555;border-bottom:1px solid #ddd;padding-bottom:6px;margin:16px 0 10px;text-transform:uppercase;}
+  table{width:100%;border-collapse:collapse;font-size:10pt;}
+  th{background:#f5f5f5;padding:7px 10px;text-align:left;font-size:0.68rem;color:#666;letter-spacing:1px;text-transform:uppercase;}
+  td{padding:7px 10px;border-bottom:1px solid #eee;}
+  .pct-good{color:#3a8a3a;font-weight:700;} .pct-mid{color:#c07000;font-weight:700;} .pct-bad{color:#c02020;font-weight:700;}
+  .bar-wrap{background:#eee;border-radius:3px;height:7px;overflow:hidden;width:100px;}
+  .bar-fill{height:100%;border-radius:3px;}
+  .code-box{background:#f5f5f5;border:1px solid #ddd;border-radius:6px;padding:12px 16px;font-size:0.9rem;margin-bottom:16px;font-family:monospace;}
+  .feedback-box{background:#fff8e8;border-left:4px solid #e8a000;padding:10px 14px;border-radius:0 6px 6px 0;margin-bottom:16px;}
+  .no-errors{background:#eafaea;border:1px solid #3a8a3a;border-radius:6px;padding:12px;text-align:center;color:#2a7a2a;font-weight:700;}
+  .footer{margin-top:24px;padding-top:12px;border-top:1px solid #ddd;font-size:0.75rem;color:#999;display:flex;justify-content:space-between;}
+  @media print{body{padding:10px 15px;} @page{margin:1.5cm;size:A4;}}
 </style></head><body>
 <div class="header">
-  <div class="walle">🤖</div>
-  <div>
-    <div class="h-title">WALL-E räumt die Erde auf</div>
-    <div class="h-sub">LERNAUSWERTUNG // KUNSTSTOFFE // KLASSE 5</div>
-  </div>
+  <div style="font-size:2.5rem;">🤖</div>
+  <div><div class="h-title">WALL-E räumt die Erde auf</div>
+  <div class="h-sub">LERNAUSWERTUNG // KUNSTSTOFFE // KLASSE 9</div></div>
 </div>
-
 <div class="meta">
-  <div class="meta-box">
-    <div class="meta-label">NAME</div>
-    <div class="meta-val">${name}</div>
-  </div>
-  <div class="meta-box">
-    <div class="meta-label">DATUM</div>
-    <div class="meta-val">${dateStr}</div>
-  </div>
-  <div class="meta-box">
-    <div class="meta-label">NIVEAU</div>
-    <div class="meta-val">${d.niveau} &nbsp; <span class="stars">${d.starStr}</span></div>
-  </div>
+  <div class="meta-box"><div class="meta-label">Name</div><div class="meta-val">${d.playerName}</div></div>
+  <div class="meta-box"><div class="meta-label">Datum</div><div class="meta-val">${dateStr}</div></div>
+  <div class="meta-box"><div class="meta-label">Niveau</div><div class="meta-val">${d.niveau} &nbsp;${d.starStr}</div></div>
 </div>
-
-<div class="code-box">
-  Stage-Codes: &nbsp;<strong>${d.allCodes}</strong> &nbsp;·&nbsp; Gesamtergebnis: <strong>${d.pct}%</strong> &nbsp;·&nbsp; Punkte: <strong>${d.score}</strong> &nbsp;·&nbsp; Richtig: <strong>${d.totalCorrect}/${d.totalEvents}</strong>
+<div class="meta" style="grid-template-columns:1fr 1fr;">
+  <div class="meta-box"><div class="meta-label">Versuch</div><div class="meta-val">${d.playCount}. Durchlauf</div></div>
+  <div class="meta-box"><div class="meta-label">Bestes Ergebnis</div><div class="meta-val">${d.bestPct}%</div></div>
 </div>
-
+<div class="code-box">Stage-Codes: <strong>${d.allCodes}</strong> &nbsp;·&nbsp; Ergebnis: <strong>${d.pct}%</strong> &nbsp;·&nbsp; Punkte: <strong>${d.score}/${d.maxScore}</strong></div>
 <div class="feedback-box">${d.feedbackMsg}</div>
-
-<div class="section-title">▶ AUSWERTUNG NACH LERNBEREICH</div>
-<table>
-  <tr><th>BEREICH</th><th>RICHTIG</th><th>QUOTE</th><th>FORTSCHRITT</th></tr>
-  ${tracker.summary().byStage.map(s => {
-    const p = s.total > 0 ? Math.round(s.correct/s.total*100) : 0;
-    const cls = p>=80?'pct-good':p>=50?'pct-mid':'pct-bad';
-    const col = p>=80?'#3a8a3a':p>=50?'#c07000':'#c02020';
-    const names = ['Sammeln & Sortieren','Eigenschaften analysieren','Recycling & Struktur'];
-    return `<tr>
-      <td>Stage ${s.s} – ${names[s.s-1]}</td>
-      <td>${s.correct}/${s.total}</td>
+<div class="section-title">▶ Auswertung nach Lernbereich</div>
+<table><tr><th>Bereich</th><th>Richtig</th><th>Quote</th><th>Fortschritt</th></tr>
+  ${tracker.summary().byStage.map(s=>{
+    const p=s.total>0?Math.round(s.correct/s.total*100):0;
+    const cls=p>=80?'pct-good':p>=50?'pct-mid':'pct-bad';
+    const col=p>=80?'#3a8a3a':p>=50?'#c07000':'#c02020';
+    const names=['Sammeln & Sortieren','Eigenschaften analysieren','Recycling & Struktur'];
+    return `<tr><td>Stage ${s.s} – ${names[s.s-1]}</td><td>${s.correct}/${s.total}</td>
       <td class="${cls}">${s.total>0?p+'%':'—'}</td>
-      <td><div class="bar-wrap"><div class="bar-fill" style="width:${p}%;background:${col};"></div></div></td>
-    </tr>`;
+      <td><div class="bar-wrap"><div class="bar-fill" style="width:${p}%;background:${col};"></div></div></td></tr>`;
   }).join('')}
 </table>
-
-${tracker.summary().wrongItems.length > 0 ? `
-<div class="section-title">▶ EMPFOHLENE WIEDERHOLUNG</div>
-<table>
-  <tr><th>AUFGABE</th><th>DEINE ANTWORT</th><th>RICHTIGE ANTWORT</th></tr>
-  ${(() => {
-    const seen = new Set();
-    return tracker.summary().wrongItems.filter(e => { if(seen.has(e.question)) return false; seen.add(e.question); return true; })
-      .map(e => {
-        const lbl = { thermo:'Thermoplaste', duro:'Duroplaste', elasto:'Elastomere', '—':'(nicht beantwortet)' };
-        return `<tr><td>${e.question}</td><td class="wrong-given">${lbl[e.given]||e.given}</td><td class="wrong-correct">${lbl[e.correct]||e.correct}</td></tr>`;
-      }).join('');
-  })()}
+${tracker.summary().wrongItems.length>0?`
+<div class="section-title">▶ Empfohlene Wiederholung</div>
+<table><tr><th>Aufgabe</th><th>Antwort</th><th>Richtig wäre</th></tr>
+  ${(()=>{const seen=new Set();return tracker.summary().wrongItems
+    .filter(e=>{if(seen.has(e.question))return false;seen.add(e.question);return true;})
+    .map(e=>{const lbl={thermo:'Thermoplaste',duro:'Duroplaste',elasto:'Elastomere','—':'(leer)','detached':'(nicht zugeordnet)','true':'richtig (✓)','false':'falsch (✗)'};
+      const tv = v => { const t=lbl[v]; if(t) return t; return v.replace(/"true"/g,'"richtig"').replace(/"false"/g,'"falsch"').replace(/:true/g,':richtig').replace(/:false/g,':falsch'); };
+      return `<tr><td>${e.question}</td><td style="color:#c02020">${tv(e.given)}</td><td style="color:#2a7a2a">${tv(e.correct)}</td></tr>`;
+    }).join('');})()}
 </table>
-<p style="font-size:9pt;color:#888;margin-top:8px;">💡 Schau dir diese Themen noch einmal auf den Seiten 347–353 in deinem Buch an.</p>` : `
-<div class="section-title">▶ FEHLERAUSWERTUNG</div>
+<p style="font-size:9pt;color:#888;margin-top:8px;">💡 S. 347–353 im Buch nachschlagen.</p>`:
+`<div class="section-title">▶ Fehlerauswertung</div>
 <div class="no-errors">🏆 Keine Fehler – alle Aufgaben korrekt gelöst!</div>`}
-
 <div class="footer">
-  <span>WALL-E räumt die Erde auf · Kunststoff-Mission · Naturwissenschaften Klasse 5</span>
-  <span>Erstellt am ${dateStr}</span>
-</div>
-</body></html>`;
+  <span>WALL-E räumt die Erde auf · Naturwissenschaften Klasse 9</span><span>${dateStr}</span>
+</div></body></html>`;
 
-  const win = window.open('', '_blank');
-  win.document.write(printHtml);
-  win.document.close();
-  win.addEventListener('load', () => { win.focus(); win.print(); });
+  const blob = new Blob([printHtml], {type:'text/html;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const win = window.open(url, '_blank');
+  if(win) {
+    win.onload = () => {
+      win.focus();
+      win.print();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    };
+  } else {
+    // Fallback if popup blocked: download as HTML
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `WALLE_${d.playerName.replace(/\s+/g,'_')}_${dateStr.replace(/\./g,'-')}.html`;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 500);
+    alert('Hinweis: Bitte erlaube Popups für diese Seite, damit das PDF direkt geöffnet wird.');
+  }
 }
-
-function printEvaluation() { showPdfModal(); }
 
 // =====================================================================
 // INIT
 // =====================================================================
-renderStage1();
-</script>
-</body>
-</html>
+renderNiveauScreen();
+</script></body></html>
